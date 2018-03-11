@@ -24,13 +24,13 @@ class IsotropicGaussian(nn.Module):
         )
 
     def _reparametrize_gaussian(self, mu, logvar):
-        #if self.training:
-        std = logvar.mul(0.5).exp_()
-        eps = float_type(self.config['cuda'])(std.size()).normal_()
-        eps = Variable(eps)
-        return eps.mul(std).add_(mu), {'mu': mu, 'logvar': logvar}
+        if self.training:
+            std = logvar.mul(0.5).exp_()
+            eps = float_type(self.config['cuda'])(std.size()).normal_()
+            eps = Variable(eps)
+            return eps.mul(std).add_(mu), {'mu': mu, 'logvar': logvar}
 
-        #return mu, {'mu': mu, 'logvar': logvar}
+        return mu, {'mu': mu, 'logvar': logvar}
 
     def reparmeterize(self, logits, eps=1e-9):
         feature_size = logits.size(-1)
@@ -65,4 +65,6 @@ class IsotropicGaussian(nn.Module):
 
     def forward(self, logits):
         z, gauss_params = self.reparmeterize(logits)
+        gauss_params['mu_mean'] = torch.mean(gauss_params['mu'])
+        gauss_params['logvar_mean'] = torch.mean(gauss_params['logvar'])
         return z, { 'z': z, 'gaussian':  gauss_params }

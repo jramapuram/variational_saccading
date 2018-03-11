@@ -111,18 +111,18 @@ class AbstractVAE(nn.Module):
 
     def build_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
-        if self.config['reparam_type'] == 'discrete':
-            decoder_input_size = int(np.prod(self.config['img_shp']))
+        decoder_input_size = self.reparameterizer.output_size
+        if self.config['layer_type'] == 'conv':
+            decoder = build_conv_decoder(input_size=decoder_input_size,
+                                         output_shape=self.input_shape,
+                                         filter_depth=self.config['filter_depth'],
+                                         activation_fn=self.activation_fn)
+        elif self.config['layer_type'] == 'dense':
+            decoder = build_dense_decoder(input_size=decoder_input_size,
+                                          output_shape=self.input_shape,
+                                          activation_fn=self.activation_fn)
         else:
-            decoder_input_size = self.config['window_size']**2
-
-        decoder = nn.Sequential(
-            View([-1, decoder_input_size]),
-            nn.Linear(decoder_input_size, 128),
-            nn.BatchNorm1d(128),
-            self.activation_fn(),
-            nn.Linear(128, self.output_size)
-        )
+            raise Exception("unknown layer type requested")
 
         if self.config['ngpu'] > 1:
             decoder = nn.DataParallel(decoder)
@@ -184,16 +184,17 @@ class AbstractVAE(nn.Module):
         z, params = self.posterior(x)
         return self.decode(z), params
 
-    def loss_function(self, predictions, labels, params, mut_info=None):
+    def loss_function(self, reconstructions, x, params, mut_info=None):
         ''' the loss function here is P(y | f(x; theta)) '''
-        nll = F.cross_entropy(input=predictions, target=labels, reduce=False)
+        #nll = F.cross_entropy(input=predictions, target=labels, reduce=False)
+        nll = nll_fn(x, reconstructions, self.config['nll_type'])
         kld = self.kld(params)
         elbo = nll + kld
 
         # handle the mutual information term
         if mut_info is None:
             mut_info = Variable(
-                float_type(self.config['cuda'])(predictions.size(0)).zero_()
+                float_type(self.config['cuda'])(x.size(0)).zero_()
             )
         else:
             # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]
@@ -208,6 +209,8 @@ class AbstractVAE(nn.Module):
             'elbo_mean': torch.mean(elbo),
             'nll_mean': torch.mean(nll),
             'kld_mean': torch.mean(kld),
+            'mu_mean': params['gaussian']['mu_mean'],
+            'logvar_mean': params['gaussian']['logvar_mean'],
             'mut_info_mean': torch.mean(mut_info)
         }
 

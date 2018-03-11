@@ -123,9 +123,9 @@ def train(epoch, model, optimizer, data_loader, grapher, prefix='train'):
         optimizer.zero_grad()
 
         # run the VAE + the DNN on the latent space
-        predictions, params = model(data)
-        loss = model.loss_function(predictions, labels, params)
-        loss['accuracy_mean'] = softmax_accuracy(predictions, labels, size_average=True)
+        pred_logits, vae_pred_logits, params = model(data)
+        loss = model.loss_function(vae_pred_logits, pred_logits, data, labels, params)
+        loss['accuracy_mean'] = softmax_accuracy(F.softmax(pred_logits, -1), labels, size_average=True)
 
         # compute loss
         loss['loss_mean'].backward()
@@ -150,7 +150,8 @@ def train(epoch, model, optimizer, data_loader, grapher, prefix='train'):
             # plot images and lines
             register_plots({**loss, **reparam_scalars}, grapher,
                            epoch=TOTAL_ITER, prefix=prefix)
-            images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
+            #images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
+            images = F.upsample(params['crop_imgs'], (args.window_size*5, args.window_size*5))
             register_images(images, 'img_crops', grapher, prefix=prefix)
             grapher.show()
 
@@ -220,9 +221,9 @@ def test(epoch, model, data_loader, grapher, prefix='test'):
         data = Variable(data).cuda() if args.cuda else Variable(data)
         labels = Variable(labels).cuda() if args.cuda else Variable(labels)
         with torch.no_grad(): # run the VAE + the DNN on the latent space
-            predictions, params = model(data)
-            loss_t = model.loss_function(predictions, labels, params)
-            loss_t['accuracy_mean'] = softmax_accuracy(predictions, labels, size_average=True)
+            pred_logits, vae_pred_logits, params = model(data)
+            loss_t = model.loss_function(vae_pred_logits, pred_logits, data, labels, params)
+            loss_t['accuracy_mean'] = softmax_accuracy(F.softmax(pred_logits, -1), labels, size_average=True)
             loss_map = _add_loss_map(loss_map, loss_t)
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
@@ -241,7 +242,8 @@ def test(epoch, model, data_loader, grapher, prefix='test'):
 
     # plot the test accuracy and loss
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-    images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
+    #images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
+    images = F.upsample(params['crop_imgs'], (args.window_size*5, args.window_size*5))
     register_images(images, 'img_crops', grapher, prefix=prefix)
 
     grapher.show()

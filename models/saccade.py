@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from helpers.utils import expand_dims, check_or_create_dir
+from helpers.layers import View
 
 # the folowing few helpers are from pyro example for AIR
 def ng_ones(*args, **kwargs):
@@ -85,10 +86,12 @@ class Saccader(nn.Module):
         super(Saccader, self).__init__()
         self.vae = vae
         self.config = kwargs['kwargs']
+        self.loss_decoder = self._build_loss_decoder()
 
     def get_name(self):
-        return "{}_{}".format(
+        return "{}_win{}_{}".format(
             str(self.config['uid']),
+            str(self.config['window_size']),
             self.vae.get_name()
         )
 
@@ -122,8 +125,36 @@ class Saccader(nn.Module):
     def encode(self, x):
         return self.vae.posterior(x)
 
-    def loss_function(self, predictions, labels, params):
-        return self.vae.loss_function(predictions, labels, params)
+    def _build_loss_decoder(self):
+        ''' helper function to build convolutional or dense decoder'''
+        if self.config['reparam_type'] == 'discrete':
+            decoder_input_size = int(np.prod(self.config['img_shp']))
+        else:
+            decoder_input_size = self.config['window_size']**2
+
+        decoder = nn.Sequential(
+            View([-1, decoder_input_size]),
+            nn.Linear(decoder_input_size, 128),
+            nn.BatchNorm1d(128),
+            nn.ELU(),
+            nn.Linear(128, self.vae.output_size)
+        )
+
+        if self.config['ngpu'] > 1:
+            decoder = nn.DataParallel(decoder)
+
+        if self.config['cuda']:
+            decoder = decoder.cuda()
+
+        return decoder
+
+    def loss_function(self, vae_pred_logits, class_pred_logits, x, labels, params):
+        vae_loss_map = self.vae.loss_function(vae_pred_logits, x, params)
+        pred_loss = F.cross_entropy(input=class_pred_logits, target=labels, reduce=False)
+        vae_loss_map['loss'] = vae_loss_map['loss'] * pred_loss
+        vae_loss_map['pred_loss_mean'] = torch.mean(pred_loss)
+        vae_loss_map['loss_mean'] = torch.mean(vae_loss_map['loss'])
+        return vae_loss_map
 
     def _z_to_image(self, z, imgs):
         ''' accepts images and z (gauss or disc)
@@ -146,6 +177,6 @@ class Saccader(nn.Module):
         ''' encode with VAE, then decode by projecting to
             classes '''
         z, params = self.encode(x)
-        img_crops = self._z_to_image(z, x)
-        params['crop_imgs'] = img_crops
-        return self.vae.decode(img_crops), params
+        params['crop_imgs'] = self._z_to_image(z, x)
+        pred_logits = self.loss_decoder(params['crop_imgs'])
+        return pred_logits, self.vae.decode(z), params
