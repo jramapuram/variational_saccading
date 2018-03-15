@@ -109,6 +109,27 @@ class AbstractVAE(nn.Module):
 
         return encoder
 
+    def _project_decoder_for_variance(self):
+        ''' if we have a nll with variance
+            then project it to the required dimensions '''
+        if self.config['layer_type'] == 'conv':
+            decoder_projector = nn.Sequential(
+                nn.BatchNorm2d(self.chans),
+                self.activation_fn(inplace=True),
+                nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
+            )
+        else:
+            input_flat = int(np.prod(self.input_shape))
+            decoder_projector = nn.Sequential(
+                View([-1, input_flat]),
+                nn.BatchNorm1d(input_flat),
+                self.activation_fn(inplace=True),
+                nn.Linear(input_flat, input_flat*2, bias=True),
+                View([-1, self.chans*2, *self.input_shape[1:]])
+            )
+
+        return decoder_projector
+
     def build_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         decoder_input_size = self.reparameterizer.output_size
@@ -123,6 +144,13 @@ class AbstractVAE(nn.Module):
                                           activation_fn=self.activation_fn)
         else:
             raise Exception("unknown layer type requested")
+
+        if self.config['nll_type'] == 'gaussian' \
+           or self.config['nll_type'] == 'clamp':
+            decoder = nn.Sequential(
+                decoder,
+                self._project_decoder_for_variance()
+            )
 
         if self.config['ngpu'] > 1:
             decoder = nn.DataParallel(decoder)
@@ -177,7 +205,7 @@ class AbstractVAE(nn.Module):
             self.full_model = nn.Sequential(OrderedDict(full_model_list))
 
     def nll_activation(self, logits):
-        return F.log_softmax(logits)
+        return nll_activation_fn(logits, self.config['nll_type'])
 
     def forward(self, x):
         ''' params is a map of the latent variable's parameters'''
@@ -185,8 +213,7 @@ class AbstractVAE(nn.Module):
         return self.decode(z), params
 
     def loss_function(self, reconstructions, x, params, mut_info=None):
-        ''' the loss function here is P(y | f(x; theta)) '''
-        #nll = F.cross_entropy(input=predictions, target=labels, reduce=False)
+        ''' the loss vae loss function '''
         nll = nll_fn(x, reconstructions, self.config['nll_type'])
         kld = self.kld(params)
         elbo = nll + kld
@@ -202,17 +229,22 @@ class AbstractVAE(nn.Module):
             # mut_info = self.config['mut_reg'] * mut_info
             mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
 
+        # VAE loss is elbo + mutual info
         loss = elbo + mut_info
-        return {
+        loss_map = {
             'loss': loss,
             'loss_mean': torch.mean(loss),
             'elbo_mean': torch.mean(elbo),
             'nll_mean': torch.mean(nll),
             'kld_mean': torch.mean(kld),
-            'mu_mean': params['gaussian']['mu_mean'],
-            'logvar_mean': params['gaussian']['logvar_mean'],
             'mut_info_mean': torch.mean(mut_info)
         }
+        if self.config['reparam_type'] == 'gaussian':
+            # add mean and logvar from gaussian reparameterizer
+            loss_map['mu_mean'] = params['gaussian']['mu_mean']
+            loss_map['logvar_mean'] = params['gaussian']['logvar_mean']
+
+        return loss_map
 
     def has_discrete(self):
         ''' returns True if the model has a discrete

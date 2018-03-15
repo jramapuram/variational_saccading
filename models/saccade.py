@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import numpy as np
 import torch.nn.functional as F
 
 from torch.autograd import Variable
@@ -128,9 +129,9 @@ class Saccader(nn.Module):
     def _build_loss_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         if self.config['reparam_type'] == 'discrete':
-            decoder_input_size = int(np.prod(self.config['img_shp']))
+            decoder_input_size = int(np.prod(self.config['img_shp']))*self.vae.chans
         else:
-            decoder_input_size = self.config['window_size']**2
+            decoder_input_size = self.config['window_size']**2*self.vae.chans
 
         decoder = nn.Sequential(
             View([-1, decoder_input_size]),
@@ -149,6 +150,7 @@ class Saccader(nn.Module):
         return decoder
 
     def loss_function(self, vae_pred_logits, class_pred_logits, x, labels, params):
+        ''' loss is: L_{classifier} * L_{VAE} '''
         vae_loss_map = self.vae.loss_function(vae_pred_logits, x, params)
         pred_loss = F.cross_entropy(input=class_pred_logits, target=labels, reduce=False)
         vae_loss_map['loss'] = vae_loss_map['loss'] * pred_loss
@@ -161,10 +163,7 @@ class Saccader(nn.Module):
             and returns an [N, C, H_trunc, W_trunc] array '''
         if self.config['reparam_type'] == 'discrete':
             assert z.size()[-2:] == imgs.size()[-2:], "mask of z should be same size"
-            if z.dim() < 4:
-                z = expand_dims(z, 1)
-
-            return z * imgs
+            return expand_dims(z[:, -1, :, :], 1) * imgs
         elif self.config['reparam_type']== 'isotropic_gaussian':
             assert z.size()[-1] == 3, "z needs to be [scale, x, y]"
             return image_to_window(z, self.config['window_size'], self.vae.input_shape, imgs)

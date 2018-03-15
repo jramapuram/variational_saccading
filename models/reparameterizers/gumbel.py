@@ -11,9 +11,10 @@ from helpers.utils import float_type, one_hot, ones_like
 
 
 class GumbelSoftmax(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dim=-1):
         super(GumbelSoftmax, self).__init__()
         self._setup_anneal_params()
+        self.dim = dim
         self.iteration = 0
         self.config = config
         self.input_size = self.config['discrete_size']
@@ -51,10 +52,10 @@ class GumbelSoftmax(nn.Module):
 
     def reparmeterize(self, logits):
         logits_shp = logits.size()
-        logits = logits.view(logits_shp[0], -1)
-        log_q_z = F.log_softmax(logits, dim=-1)
+        log_q_z = F.log_softmax(logits, dim=self.dim)
         z, z_hard = self.sample_gumbel(logits, self.tau,
                                        hard=True,
+                                       dim=self.dim,
                                        use_cuda=self.config['cuda'])
         return z.view(logits_shp), z_hard.view(logits_shp), log_q_z
 
@@ -73,21 +74,20 @@ class GumbelSoftmax(nn.Module):
         # return torch.mean(crossent_loss) + torch.mean(ent_loss)
 
     @staticmethod
-    def _kld_categorical_uniform(log_q_z, eps=1e-9):
+    def _kld_categorical_uniform(log_q_z, dim=-1, eps=1e-9):
         shp = log_q_z.size()
-        log_q_z = log_q_z.view(shp[0], -1)
-        p_z = 1.0 / int(np.prod(shp[1:]))
+        p_z = 1.0 / shp[dim]
         log_p_z = np.log(p_z)
         kld_element = log_q_z.exp() * (log_q_z - log_p_z)
-        return kld_element.view(shp)
+        return torch.sum(kld_element.view(shp[0], -1), -1)
 
     def kl(self, dist_a):
         return GumbelSoftmax._kld_categorical_uniform(
-            dist_a['discrete']['log_q_z'],
+            dist_a['discrete']['log_q_z'], dim=self.dim
         )
 
     @staticmethod
-    def _gumbel_softmax(x, tau, eps=1e-9, use_cuda=False):
+    def _gumbel_softmax(x, tau, eps=1e-9, dim=-1, use_cuda=False):
         noise = torch.rand(x.size())
         # -ln(-ln(U + eps) + eps)
         noise.add_(eps).log_().neg_()
@@ -97,15 +97,15 @@ class GumbelSoftmax(nn.Module):
 
         noise = Variable(noise)
         x = (x + noise) / tau
-        x = F.softmax(x + eps, dim=-1)
+        x = F.softmax(x + eps, dim=dim)
         return x.view_as(x)
 
     @staticmethod
-    def sample_gumbel(x, tau, hard=False, use_cuda=True):
-        y = GumbelSoftmax._gumbel_softmax(x, tau, use_cuda=use_cuda)
+    def sample_gumbel(x, tau, hard=False, dim=-1, use_cuda=True):
+        y = GumbelSoftmax._gumbel_softmax(x, tau, dim=dim, use_cuda=use_cuda)
 
         if hard:
-            y_max, _ = torch.max(y, dim=-1, keepdim=True)
+            y_max, _ = torch.max(y, dim=dim, keepdim=True)
             y_hard = Variable(
                 torch.eq(y_max.data, y.data).type(float_type(use_cuda))
             )

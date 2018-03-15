@@ -18,7 +18,8 @@ from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
 from helpers.metrics import softmax_accuracy
 from helpers.utils import float_type, ones_like, \
-    append_to_csv, num_samples_in_loader, expand_dims
+    append_to_csv, num_samples_in_loader, expand_dims, \
+    dummy_context
 
 parser = argparse.ArgumentParser(description='Variational Saccading')
 
@@ -54,8 +55,6 @@ parser.add_argument('--mut-reg', type=float, default=0.3,
                     help='mutual information regularizer [mixture only] (default: 0.3)')
 parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                     help='learning rate (default: 1e-3)')
-parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                    help='how many batches to wait before logging training status')
 parser.add_argument('--vae-type', type=str, default='parallel',
                     help='vae type [sequential or parallel] (default: parallel)')
 parser.add_argument('--use-relational-encoder', action='store_true',
@@ -111,65 +110,19 @@ def build_optimizer(model):
     )
 
 
-def train(epoch, model, optimizer, data_loader, grapher, prefix='train'):
-    global TOTAL_ITER
-    model.train()
-
-    for batch_idx, (data, label) in enumerate(data_loader):
-        data = Variable(data).cuda() if args.cuda else Variable(data)
-        labels = Variable(label).cuda() if args.cuda else Variable(label)
-
-        # zero gradients on optimizer
-        optimizer.zero_grad()
-
-        # run the VAE + the DNN on the latent space
-        pred_logits, vae_pred_logits, params = model(data)
-        loss = model.loss_function(vae_pred_logits, pred_logits, data, labels, params)
-        loss['accuracy_mean'] = softmax_accuracy(F.softmax(pred_logits, -1), labels, size_average=True)
-
-        # compute loss
-        loss['loss_mean'].backward()
-        optimizer.step()
-
-        # log every nth interval
-        if batch_idx % args.log_interval == 0:
-            # the total number of samples is different
-            # if we have filtered using the class_sampler
-            num_samples = num_samples_in_loader(data_loader)
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tKLD: {:.4f}\tNLL: {:.4f}\tAcc: {:.4f}'.format(
-                epoch, batch_idx * len(data), num_samples,
-                100. * batch_idx * len(data) / num_samples,
-                loss['loss_mean'].data[0], loss['kld_mean'].data[0],
-                loss['nll_mean'].data[0],
-                loss['accuracy_mean']
-            ))
-
-            # gether scalar values of reparameterizers
-            reparam_scalars = model.vae.get_reparameterizer_scalars()
-
-            # plot images and lines
-            register_plots({**loss, **reparam_scalars}, grapher,
-                           epoch=TOTAL_ITER, prefix=prefix)
-            #images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
-            images = F.upsample(params['crop_imgs'], (args.window_size*5, args.window_size*5))
-            register_images(images, 'img_crops', grapher, prefix=prefix)
-            grapher.show()
-
-
-        TOTAL_ITER += 1
-
-
 def register_images(images, names, grapher, prefix="train"):
+    ''' helper to register a list of images '''
     if isinstance(images, list):
         assert len(images) == len(names)
         for im, name in zip(images, names):
             register_images(im, name, grapher, prefix=prefix)
-
-    images = torch.min(images, ones_like(images))
-    grapher.register_single({'{}_{}'.format(prefix, names): images},
-                            plot_type='imgs')
+    else:
+        images = torch.min(images, ones_like(images))
+        grapher.register_single({'{}_{}'.format(prefix, names): images},
+                                plot_type='imgs')
 
 def register_plots(loss, grapher, epoch, prefix='train'):
+    ''' helper to register all plots with *_mean and *_scalar '''
     for k, v in loss.items():
         if isinstance(v, map):
             register_plots(loss[k], grapher, epoch, prefix=prefix)
@@ -182,6 +135,8 @@ def register_plots(loss, grapher, epoch, prefix='train'):
 
 
 def _add_loss_map(loss_tm1, loss_t):
+    ''' helper to add two maps and keep counts
+        of the total samples for reduction later'''
     if not loss_tm1: # base case: empty dict
         resultant = {'count': 1}
         for k, v in loss_t.items():
@@ -207,31 +162,45 @@ def _add_loss_map(loss_tm1, loss_t):
 
 
 def _mean_map(loss_map):
+    ''' helper to reduce all values by the key count '''
     for k in loss_map.keys():
         loss_map[k] /= loss_map['count']
 
     return loss_map
 
 
-def test(epoch, model, data_loader, grapher, prefix='test'):
-    model.eval()
-    loss_map, params = {}, {}
+def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
+    ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
+    model.eval() if not 'train' in prefix else model.train()
+    assert optimizer is not None if 'train' in prefix else optimizer is None
+    loss_map, params, num_samples = {}, {}, 0
 
     for data, labels in data_loader:
         data = Variable(data).cuda() if args.cuda else Variable(data)
         labels = Variable(labels).cuda() if args.cuda else Variable(labels)
-        with torch.no_grad(): # run the VAE + the DNN on the latent space
+
+        if 'train' in prefix:
+            # zero gradients on optimizer
+            optimizer.zero_grad()
+
+        with torch.no_grad() if 'train' not in prefix else dummy_context():
+            # run the VAE + the DNN on the latent space
             pred_logits, vae_pred_logits, params = model(data)
             loss_t = model.loss_function(vae_pred_logits, pred_logits, data, labels, params)
             loss_t['accuracy_mean'] = softmax_accuracy(F.softmax(pred_logits, -1), labels, size_average=True)
             loss_map = _add_loss_map(loss_map, loss_t)
+            num_samples += pred_logits.size(0)
+
+        if 'train' in prefix:
+            # compute bp and optimize
+            loss_t['loss_mean'].backward()
+            optimizer.step()
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean'] # / num_total_samples
 
-    print('\n{}[{} samples]: Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tAcc: {:.4f}\n'.format(
-        prefix,
-        num_samples_in_loader(data_loader),
+    print('{}[Epoch {0:04d}][{0:7d} samples]: Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tAcc: {:.4f}'.format(
+        prefix, epoch, num_samples,
         loss_map['loss_mean'].data[0],
         loss_map['kld_mean'].data[0],
         loss_map['nll_mean'].data[0],
@@ -240,20 +209,34 @@ def test(epoch, model, data_loader, grapher, prefix='test'):
     # gether scalar values of reparameterizers
     reparam_scalars = model.vae.get_reparameterizer_scalars()
 
-    # plot the test accuracy and loss
+    # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-    #images = F.upsample(params['crop_imgs'], (28, 28), mode='bilinear')
-    images = F.upsample(params['crop_imgs'], (args.window_size*5, args.window_size*5))
-    register_images(images, 'img_crops', grapher, prefix=prefix)
+    images = [data, F.upsample(data, (32, 32), mode='bilinear'),
+              F.upsample(params['crop_imgs'], (args.window_size*10, args.window_size*10)),
+              model.vae.nll_activation(vae_pred_logits)]
+    img_names = ['original_imgs', 'downsampled_imgs', 'img_crops', 'vae_reconstructions']
+    register_images(images, img_names, grapher, prefix=prefix)
 
     grapher.show()
 
     # return this for early stopping
-    loss_val = loss_map['elbo_mean'].detach().data[0]
+    loss_val = loss_map['loss_mean'].detach().data[0]
     loss_map.clear()
     params.clear()
     return loss_val, correct_percent
 
+
+def train(epoch, model, optimizer, data_loader, grapher, prefix='train'):
+    ''' train loop helper '''
+    return execute_graph(epoch, model, loader.train_loader,
+                         grapher, optimizer, 'train')
+
+
+def test(epoch, model, data_loader, grapher, prefix='test'):
+     ''' test loop helper '''
+     return execute_graph(epoch, model,
+                          loader.test_loader,
+                          grapher, prefix='test')
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''

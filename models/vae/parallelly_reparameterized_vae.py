@@ -31,7 +31,7 @@ class ParallellyReparameterizedVAE(AbstractVAE):
             self.reparameterizer = IsotropicGaussian(self.config)
         elif self.config['reparam_type'] == "discrete":
             print("using gumbel softmax reparameterizer")
-            self.reparameterizer = GumbelSoftmax(self.config)
+            self.reparameterizer = GumbelSoftmax(self.config, dim=1)
         elif self.config['reparam_type'] == "mixture":
             raise NotImplementedError("mixture not currently supported")
             # print("using mixture reparameterizer")
