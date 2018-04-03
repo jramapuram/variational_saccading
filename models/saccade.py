@@ -78,8 +78,25 @@ def image_to_window(z_where, window_size, image_size, images):
     theta_inv = expand_z_where(z_where_inv(z_where))
     grid = F.affine_grid(theta_inv, torch.Size((n, 1, window_size, window_size)))
     out = F.grid_sample(images.view(n, *image_size), grid)
-    #return out.view(n, -1)
     return out
+
+
+def image_to_window_discrete(z_where, window_size, image_size, images, scale=None):
+    n = images.size(0)
+    assert images.size(2) == images.size(3) == image_size[1] == image_size[2], 'Size mismatch.'
+    x_where, y_where = (z_where > 0).nonzero()
+    if scale: # scale the window size
+        window_size *= scale
+
+    # tabulate upper left and bottom right positions
+    window_upper_left = [x_where, y_where] - (window_size // 2)
+    window_lower_right = [x_where, y_where] + (window_size // 2)
+    assert window_upper_left > [0, 0]
+    assert window_lower_right < [images.size(2), images.size(3)]
+
+    # index out
+    return images[:, :, window_upper_left[0]:window_lower_right[0], # x
+                  window_upper_left[1]:window_lower_right[1]]       # y
 
 
 class Saccader(nn.Module):
@@ -90,9 +107,11 @@ class Saccader(nn.Module):
         self.loss_decoder = self._build_loss_decoder()
 
     def get_name(self):
-        return "{}_win{}_{}".format(
+        return "{}_win{}_us{}_dscale{}_{}".format(
             str(self.config['uid']),
             str(self.config['window_size']),
+            str(self.config['upsample_size']),
+            str(self.config['downsample_scale']),
             self.vae.get_name()
         )
 
@@ -141,9 +160,6 @@ class Saccader(nn.Module):
             nn.Linear(128, self.vae.output_size)
         )
 
-        if self.config['ngpu'] > 1:
-            decoder = nn.DataParallel(decoder)
-
         if self.config['cuda']:
             decoder = decoder.cuda()
 
@@ -162,20 +178,23 @@ class Saccader(nn.Module):
         ''' accepts images and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
         if self.config['reparam_type'] == 'discrete':
-            assert z.size()[-2:] == imgs.size()[-2:], "mask of z should be same size"
-            return expand_dims(z[:, -1, :, :], 1) * imgs
-        elif self.config['reparam_type']== 'isotropic_gaussian':
-            assert z.size()[-1] == 3, "z needs to be [scale, x, y]"
-            return image_to_window(z, self.config['window_size'], self.vae.input_shape, imgs)
+            raise NotImplementedError
+        elif self.config['reparam_type']== 'isotropic_gaussian' or self.config['reparam_type']== 'mixture':
+            assert z.size()[-1] >= 3, "z needs to be [scale, x, y]"
+            img_size = list(imgs.size())[1:]
+            return image_to_window(z[:, 0:3], self.config['window_size'], img_size, imgs)
         else:
             raise Exception("{} reparameterizer not supported".format(
                 self.config['reparam_type']
             ))
 
-    def forward(self, x):
-        ''' encode with VAE, then decode by projecting to
-            classes '''
-        z, params = self.encode(x)
+    def forward(self, x, x_related):
+        ''' encode with VAE, then decode by projecting to classes '''
+        z, params = self.encode(x_related)
+
+        # extract regions from true image
         params['crop_imgs'] = self._z_to_image(z, x)
+
+        # predict loss and decoded reconstruction
         pred_logits = self.loss_decoder(params['crop_imgs'])
         return pred_logits, self.vae.decode(z), params

@@ -20,24 +20,20 @@ class ParallellyReparameterizedVAE(AbstractVAE):
                                                            activation_fn=activation_fn,
                                                            **kwargs)
 
-        # update the config to get repram to be appropriately sized
-        self.config['discrete_size'] = deepcopy(self.input_shape)
-        self.config['discrete_size'][0] *= 2
-        self.config['continuous_size'] = 3*2 # [S, X, Y]
-
         # build the reparameterizer
         if self.config['reparam_type'] == "isotropic_gaussian":
             print("using isotropic gaussian reparameterizer")
             self.reparameterizer = IsotropicGaussian(self.config)
         elif self.config['reparam_type'] == "discrete":
-            print("using gumbel softmax reparameterizer")
-            self.reparameterizer = GumbelSoftmax(self.config, dim=1)
+            raise NotImplementedError("discrete not implemented")
+            # self.config['discrete_size'] = deepcopy(self.input_shape[-2:])
+            # print("using gumbel softmax reparameterizer")
+            # self.reparameterizer = GumbelSoftmax(self.config, dim=1)
         elif self.config['reparam_type'] == "mixture":
-            raise NotImplementedError("mixture not currently supported")
-            # print("using mixture reparameterizer")
-            # self.reparameterizer = Mixture(num_discrete=self.config['discrete_size'],
-            #                                num_continuous=self.config['continuous_size'],
-            #                                config=self.config)
+            print("using mixture reparameterizer")
+            self.reparameterizer = Mixture(num_discrete=self.config['discrete_size'],
+                                           num_continuous=self.config['continuous_size'],
+                                           config=self.config)
         else:
             raise Exception("unknown reparameterization type")
 

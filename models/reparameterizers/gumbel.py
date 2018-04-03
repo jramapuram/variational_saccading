@@ -19,7 +19,6 @@ class GumbelSoftmax(nn.Module):
         self.config = config
         self.input_size = self.config['discrete_size']
         self.output_size = self.config['discrete_size']
-        assert isinstance(self.input_size, (list, tuple))
 
     def prior(self, batch_size):
         uniform_probs = float_type(self.config['cuda'])(1, self.output_size[-1]).zero_()
@@ -34,7 +33,7 @@ class GumbelSoftmax(nn.Module):
         # setup the base gumbel rates
         # TODO: parameterize this
         self.tau, self.tau0 = 1.0, 1.0
-        self.anneal_rate = 3e-5
+        self.anneal_rate = 3e-6
         self.min_temp = 0.5
 
     def anneal(self, anneal_interval=10):
@@ -79,7 +78,8 @@ class GumbelSoftmax(nn.Module):
         p_z = 1.0 / shp[dim]
         log_p_z = np.log(p_z)
         kld_element = log_q_z.exp() * (log_q_z - log_p_z)
-        return torch.sum(kld_element.view(shp[0], -1), -1)
+        #return torch.sum(kld_element.view(shp[0], -1), -1)
+        return kld_element
 
     def kl(self, dist_a):
         return GumbelSoftmax._kld_categorical_uniform(

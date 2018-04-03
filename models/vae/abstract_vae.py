@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from collections import OrderedDict, Counter
 
-from helpers.utils import float_type
+from helpers.utils import same_type
 from models.relational_network import RelationalNetwork
 from helpers.layers import View, flatten_layers, \
     build_conv_encoder, build_dense_encoder, \
@@ -101,9 +101,6 @@ class AbstractVAE(nn.Module):
         else:
             raise Exception("unknown layer type requested")
 
-        if self.config['ngpu'] > 1:
-            encoder = nn.DataParallel(encoder)
-
         if self.config['cuda']:
             encoder = encoder.cuda()
 
@@ -152,9 +149,6 @@ class AbstractVAE(nn.Module):
                 self._project_decoder_for_variance()
             )
 
-        if self.config['ngpu'] > 1:
-            decoder = nn.DataParallel(decoder)
-
         if self.config['cuda']:
             decoder = decoder.cuda()
 
@@ -171,11 +165,6 @@ class AbstractVAE(nn.Module):
                 nn.Linear(input_size, output_size)
             ))
 
-            if self.config['ngpu'] > 1:
-                setattr(self, name,
-                        nn.DataParallel(getattr(self, name))
-                )
-
             if self.config['cuda']:
                 setattr(self, name, getattr(self, name).cuda())
 
@@ -188,12 +177,6 @@ class AbstractVAE(nn.Module):
                                                   output_size=output_size,
                                                   cuda=self.config['cuda'],
                                                   ngpu=self.config['ngpu']))
-
-            if self.config['ngpu'] > 1:
-                setattr(self, name,
-                        nn.DataParallel(getattr(self, name))
-                )
-
             if self.config['cuda']:
                 setattr(self, name, getattr(self, name).cuda())
 
@@ -221,7 +204,7 @@ class AbstractVAE(nn.Module):
         # handle the mutual information term
         if mut_info is None:
             mut_info = Variable(
-                float_type(self.config['cuda'])(x.size(0)).zero_()
+                same_type(self.config['half'], self.config['cuda'])(x.size(0)).zero_()
             )
         else:
             # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]

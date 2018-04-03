@@ -6,7 +6,8 @@ import torch.distributions as D
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from helpers.utils import float_type, zeros_like, ones_like
+from helpers.utils import zeros_like, ones_like, same_type
+from helpers.utils import eps as eps_fn
 
 
 class IsotropicGaussian(nn.Module):
@@ -20,19 +21,23 @@ class IsotropicGaussian(nn.Module):
 
     def prior(self, batch_size):
         return Variable(
-            float_type(self.config['cuda'])(batch_size, self.output_size).normal_()
+            same_type(self.config['half'], self.config['cuda'])(
+                batch_size, self.output_size
+            ).normal_()
         )
 
     def _reparametrize_gaussian(self, mu, logvar):
         if self.training:
             std = logvar.mul(0.5).exp_()
-            eps = float_type(self.config['cuda'])(std.size()).normal_()
+            eps = same_type(self.config['half'],
+                            self.config['cuda'])(std.size()).normal_()
             eps = Variable(eps)
             return eps.mul(std).add_(mu), {'mu': mu, 'logvar': logvar}
 
         return mu, {'mu': mu, 'logvar': logvar}
 
-    def reparmeterize(self, logits, eps=1e-9):
+    def reparmeterize(self, logits):
+        eps = eps_fn(self.config['half'])
         feature_size = logits.size(-1)
         assert feature_size % 2 == 0 and feature_size // 2 == self.output_size
         if logits.dim() == 2:
