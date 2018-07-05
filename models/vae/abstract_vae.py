@@ -3,27 +3,23 @@ import pprint
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
 from collections import OrderedDict, Counter
 
-from helpers.utils import same_type
-from models.relational_network import RelationalNetwork
-from helpers.layers import View, flatten_layers, \
-    build_conv_encoder, build_dense_encoder, \
-    build_relational_conv_encoder, build_conv_decoder, \
-    build_dense_decoder
+from helpers.utils import float_type
+from helpers.layers import View, flatten_layers, Identity, \
+    build_gated_conv_encoder, build_conv_encoder, build_dense_encoder, build_gated_dense_encoder, \
+    build_gated_conv_decoder, build_conv_decoder, build_dense_decoder, build_gated_dense_decoder, \
+    build_relational_conv_encoder, build_pixelcnn_decoder, str_to_activ_module
 from helpers.distributions import nll_activation as nll_activation_fn
 from helpers.distributions import nll as nll_fn
 
 
 class AbstractVAE(nn.Module):
     ''' abstract base class for VAE, both sequentialVAE and parallelVAE inherit this '''
-    def __init__(self, input_shape, output_size, activation_fn=nn.ELU, **kwargs):
+    def __init__(self, input_shape, **kwargs):
         super(AbstractVAE, self).__init__()
         self.input_shape = input_shape
-        self.output_size = output_size
-        self.activation_fn = activation_fn
         self.is_color = input_shape[0] > 1
         self.chans = 3 if self.is_color else 1
 
@@ -32,20 +28,27 @@ class AbstractVAE(nn.Module):
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.config)
 
-        # placeholder in order to sequentialize model
-        self.full_model = None
+        # grab the activation nn.Module from the string
+        self.activation_fn = str_to_activ_module(self.config['activation'])
 
     def get_name(self, reparam_str):
         ''' helper to get the name of the model '''
         es_str = "es" + str(int(self.config['early_stop'])) if self.config['early_stop'] \
                  else "epochs" + str(self.config['epochs'])
-        full_hash_str = "_{}_{}act{}_input{}_batch{}_mut{}_filter{}_nll{}_lr{}_{}_ngpu{}".format(
+        full_hash_str = "_{}_{}act{}_pd{}_klr{}_gsv{}_mcig{}_mcs{}{}_input{}_batch{}_mut{}d{}c_filter{}_nll{}_lr{}_{}_ngpu{}".format(
             str(self.config['layer_type']),
             reparam_str,
             str(self.activation_fn.__name__),
+            str(int(self.config['use_pixel_cnn_decoder'])),
+            str(self.config['kl_reg']),
+            str(self.config['generative_scale_var']),
+            str(int(self.config['monte_carlo_infogain'])),
+            str(self.config['mut_clamp_strategy']),
+            "{}".format(str(self.config['mut_clamp_value'])) if self.config['mut_clamp_strategy'] == 'clamp' else "",
             str(self.input_shape),
             str(self.config['batch_size']),
-            str(self.config['mut_reg']),
+            str(self.config['discrete_mut_info']),
+            str(self.config['continuous_mut_info']),
             str(self.config['filter_depth']),
             str(self.config['nll_type']),
             str(self.config['lr']),
@@ -65,6 +68,7 @@ class AbstractVAE(nn.Module):
         task_cleaned = AbstractVAE._clean_task_str(self.config['task'])
         return task_cleaned + full_hash_str
 
+
     @staticmethod
     def _clean_task_str(task_str):
         ''' helper to reduce string length.
@@ -81,111 +85,157 @@ class AbstractVAE(nn.Module):
 
     def build_encoder(self):
         ''' helper function to build convolutional or dense encoder '''
-        encoder_output_size = self.reparameterizer.input_size
         if self.config['layer_type'] == 'conv':
             if self.config['use_relational_encoder']:
                 encoder = build_relational_conv_encoder(input_shape=self.input_shape,
                                                         filter_depth=self.config['filter_depth'],
                                                         activation_fn=self.activation_fn)
             else:
-                encoder = build_conv_encoder(input_shape=self.input_shape,
-                                             output_size=encoder_output_size,
-                                             filter_depth=self.config['filter_depth'],
-                                             activation_fn=self.activation_fn)
+                conv_builder = build_gated_conv_encoder \
+                           if self.config['disable_gated'] is False else build_conv_encoder
+                encoder = conv_builder(input_shape=self.input_shape,
+                                       output_size=self.reparameterizer.input_size,
+                                       filter_depth=self.config['filter_depth'],
+                                       activation_fn=self.activation_fn,
+                                       normalization_str=self.config['normalization'])
         elif self.config['layer_type'] == 'dense':
-            print("is = ", self.input_shape)
-            encoder = build_dense_encoder(input_shape=self.input_shape,
-                                          output_size=encoder_output_size,
-                                          latent_size=512,
-                                          activation_fn=self.activation_fn)
+            dense_builder = build_gated_dense_encoder \
+                if self.config['disable_gated'] is False else build_dense_encoder
+            encoder = dense_builder(input_shape=self.input_shape,
+                                    output_size=self.reparameterizer.input_size,
+                                    latent_size=512,
+                                    activation_fn=self.activation_fn,
+                                    normalization_str=self.config['normalization'])
         else:
             raise Exception("unknown layer type requested")
+
+        if self.config['ngpu'] > 1:
+            encoder = nn.DataParallel(encoder)
 
         if self.config['cuda']:
             encoder = encoder.cuda()
 
         return encoder
 
-    def _project_decoder_for_variance(self):
-        ''' if we have a nll with variance
-            then project it to the required dimensions '''
-        if self.config['layer_type'] == 'conv':
-            decoder_projector = nn.Sequential(
-                nn.BatchNorm2d(self.chans),
-                self.activation_fn(inplace=True),
-                nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
-            )
-        else:
-            input_flat = int(np.prod(self.input_shape))
-            decoder_projector = nn.Sequential(
-                View([-1, input_flat]),
-                nn.BatchNorm1d(input_flat),
-                self.activation_fn(inplace=True),
-                nn.Linear(input_flat, input_flat*2, bias=True),
-                View([-1, self.chans*2, *self.input_shape[1:]])
-            )
+    def lazy_build_decoder(self, input_size):
+        ''' lazily build the decoder network '''
+        if not hasattr(self, 'decoder'):
+            setattr(self, 'decoder', self._build_decoder(input_size))
 
-        return decoder_projector
+        return self.decoder
 
     def build_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
-        decoder_input_size = self.reparameterizer.output_size
+        return self._build_decoder(self.reparameterizer.output_size)
+
+    def _build_decoder(self, input_size, reupsample=True):
+        ''' helper function to build convolutional or dense decoder'''
         if self.config['layer_type'] == 'conv':
-            decoder = build_conv_decoder(input_size=decoder_input_size,
-                                         output_shape=self.input_shape,
-                                         filter_depth=self.config['filter_depth'],
-                                         activation_fn=self.activation_fn)
+            conv_builder = build_gated_conv_decoder \
+                           if self.config['disable_gated'] is False else build_conv_decoder
+            decoder = nn.Sequential(
+                conv_builder(input_size=input_size,
+                             output_shape=self.input_shape,
+                             filter_depth=self.config['filter_depth'],
+                             activation_fn=self.activation_fn,
+                             normalization_str=self.config['normalization'],
+                             reupsample=reupsample)
+            )
+            if self.config['use_pixel_cnn_decoder']:
+                print("adding pixel CNN decoder...")
+                decoder = nn.Sequential(
+                    decoder,
+                    build_pixelcnn_decoder(input_size=self.chans,
+                                           output_shape=self.input_shape,
+                                           normalization_str=self.config['normalization'])
+                )
+
         elif self.config['layer_type'] == 'dense':
-            decoder = build_dense_decoder(input_size=decoder_input_size,
-                                          output_shape=self.input_shape,
-                                          activation_fn=self.activation_fn)
+            dense_builder = build_gated_dense_decoder \
+                if self.config['disable_gated'] is False else build_dense_decoder
+
+            decoder = dense_builder(input_shape=input_size,
+                                    output_shape=self.input_shape,
+                                    activation_fn=self.activation_fn,
+                                    normalization_str=self.config['normalization'])
         else:
             raise Exception("unknown layer type requested")
 
-        if self.config['nll_type'] == 'gaussian' \
-           or self.config['nll_type'] == 'clamp':
-            decoder = nn.Sequential(
-                decoder,
-                self._project_decoder_for_variance()
-            )
+        if self.config['ngpu'] > 1:
+            decoder = nn.DataParallel(decoder)
 
         if self.config['cuda']:
             decoder = decoder.cuda()
 
         return decoder
 
-    def _lazy_init_dense(self, input_size, output_size, name='enc_proj'):
-        '''initialize the dense linear projection lazily
-           because determining convolutional output size
-           is annoying '''
-        if not hasattr(self, name):
-            # build a simple linear projector
-            setattr(self, name, nn.Sequential(
-                View([-1, input_size]),
-                nn.Linear(input_size, output_size)
-            ))
+    def _project_decoder_for_variance(self, logits):
+        ''' if we have a nll with variance
+            then project it to the required dimensions '''
+        if self.config['nll_type'] == 'gaussian' \
+           or self.config['nll_type'] == 'clamp':
+            if not hasattr(self, 'decoder_projector'):
+                if self.config['layer_type'] == 'conv':
+                    self.decoder_projector = nn.Sequential(
+                        add_normalization(Identity(), self.config['normalization'], 2, self.chans, num_groups=32),
+                        self.activation_fn(),
+                        nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
+                    )
+                else:
+                    input_flat = int(np.prod(self.input_shape))
+                    self.decoder_projector = nn.Sequential(
+                        View([-1, input_flat]),
+                        add_normalization(Identity(), self.config['normalization'], 1, input_flat),
+                        self.activation_fn(),
+                        nn.Linear(input_flat, input_flat*2, bias=True),
+                        View([-1, self.chans*2, *self.input_shape[1:]])
+                    )
 
-            if self.config['cuda']:
-                setattr(self, name, getattr(self, name).cuda())
+                if self.config['cuda']:
+                    self.decoder_projector.cuda()
 
-    def _lazy_init_relational(self, output_size, name='enc_proj'):
-        '''initialize a relational network lazily
-           because determining convolutional output size
-           is annoying '''
-        if not hasattr(self, name):
-            setattr(self, name, RelationalNetwork(hidden_size=512, #XXX
-                                                  output_size=output_size,
-                                                  cuda=self.config['cuda'],
-                                                  ngpu=self.config['ngpu']))
-            if self.config['cuda']:
-                setattr(self, name, getattr(self, name).cuda())
+            return self.decoder_projector(logits)
+
+        # bernoulli reconstruction
+        return logits
 
     def compile_full_model(self):
         ''' takes all the submodules and module-lists
             and returns one gigantic sequential_model '''
-        if not self.full_model:
-            full_model_list, _ = flatten_layers(self)
-            self.full_model = nn.Sequential(OrderedDict(full_model_list))
+        full_model_list, _ = flatten_layers(self)
+        return nn.Sequential(OrderedDict(full_model_list))
+
+    def generate_synthetic_samples(self, batch_size, **kwargs):
+        z_samples = self.reparameterizer.prior(
+            batch_size, scale_var=self.config['generative_scale_var'], **kwargs
+        )
+        return self.nll_activation(self.decode(z_samples))
+
+    def generate_synthetic_sequential_samples(self, num_rows=8):
+        assert self.has_discrete()
+
+        # create a grid of one-hot vectors for displaying in visdom
+        # uses one row for original dimension of discrete component
+        discrete_indices = np.array([np.random.randint(begin, end, size=num_rows) for begin, end in
+                                     zip(range(0, self.reparameterizer.config['discrete_size'],
+                                               self.config['discrete_size']),
+                                         range(self.config['discrete_size'],
+                                               self.reparameterizer.config['discrete_size'] + 1,
+                                               self.config['discrete_size']))])
+        discrete_indices = discrete_indices.reshape(-1)
+        with torch.no_grad():
+            z_samples = Variable(torch.from_numpy(
+                one_hot_np(self.reparameterizer.config['discrete_size'],
+                           discrete_indices))
+            )
+            z_samples = z_samples.type(float_type(self.config['cuda']))
+
+            if self.config['reparam_type'] == 'mixture' and self.config['vae_type'] != 'sequential':
+                ''' add in the gaussian prior '''
+                z_gauss = self.reparameterizer.gaussian.prior(z_samples.size(0))
+                z_samples = torch.cat([z_gauss, z_samples], dim=-1)
+
+            return self.nll_activation(self.decode(z_samples))
 
     def nll_activation(self, logits):
         return nll_activation_fn(logits, self.config['nll_type'])
@@ -195,26 +245,31 @@ class AbstractVAE(nn.Module):
         z, params = self.posterior(x)
         return self.decode(z), params
 
-    def loss_function(self, reconstructions, x, params, mut_info=None):
-        ''' the loss vae loss function '''
-        nll = nll_fn(x, reconstructions, self.config['nll_type'])
-        kld = self.kld(params)
+    def loss_function(self, recon_x, x, params, mut_info=None):
+        # tf: elbo = -log_likelihood + latent_kl
+        # tf: cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
+        nll = nll_fn(x, recon_x, self.config['nll_type'])
+        kld = self.config['kl_reg'] * self.kld(params)
         elbo = nll + kld
 
         # handle the mutual information term
         if mut_info is None:
             mut_info = Variable(
-                same_type(self.config['half'], self.config['cuda'])(x.size(0)).zero_()
+                float_type(self.config['cuda'])(x.size(0)).zero_()
             )
         else:
-            # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]
-            # mut_info = self.config['mut_reg'] * torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
-            # mut_info = self.config['mut_reg'] * mut_info
-            mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
+            # Clamping strategies
+            mut_clamp_strategy_map = {
+                'none': lambda mut_info: mut_info,
+                'norm': lambda mut_info: mut_info / torch.norm(mut_info, p=2),
+                'clamp': lambda mut_info: torch.clamp(mut_info,
+                                                      min=-self.config['mut_clamp_value'],
+                                                      max=self.config['mut_clamp_value'])
+            }
+            mut_info = mut_clamp_strategy_map[self.config['mut_clamp_strategy'].strip().lower()](mut_info)
 
-        # VAE loss is elbo + mutual info
-        loss = elbo + mut_info
-        loss_map = {
+        loss = elbo - mut_info
+        return {
             'loss': loss,
             'loss_mean': torch.mean(loss),
             'elbo_mean': torch.mean(elbo),
@@ -222,12 +277,6 @@ class AbstractVAE(nn.Module):
             'kld_mean': torch.mean(kld),
             'mut_info_mean': torch.mean(mut_info)
         }
-        if self.config['reparam_type'] == 'gaussian':
-            # add mean and logvar from gaussian reparameterizer
-            loss_map['mu_mean'] = params['gaussian']['mu_mean']
-            loss_map['logvar_mean'] = params['gaussian']['logvar_mean']
-
-        return loss_map
 
     def has_discrete(self):
         ''' returns True if the model has a discrete
@@ -255,10 +304,6 @@ class AbstractVAE(nn.Module):
     def encode(self, x):
         ''' encodes via a convolution and returns logits '''
         raise NotImplementedError("encode not implemented")
-
-    def generate(self, z):
-        ''' returns a generation for a given z '''
-        raise NotImplementedError("generate not implemented")
 
     def kld(self, dist_params):
         ''' KL divergence between dist_a and prior '''

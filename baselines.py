@@ -1,4 +1,3 @@
-import time
 import argparse
 import numpy as np
 import pprint
@@ -9,17 +8,16 @@ import torch.nn.functional as F
 
 from copy import deepcopy
 from torch.autograd import Variable
+from torchvision.models.resnet import resnet18
+from torchvision.models import vgg16_bn
 
-from models.vae.vrnn import VRNN
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
-from helpers.layers import EarlyStopping, init_weights
+from helpers.layers import EarlyStopping, init_weights, BWtoRGB
 from models.pool import train_model_pool
 from models.saccade import Saccader
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
 from optimizers.adamnormgrad import AdamNormGrad
-from optimizers.adamw import AdamW
-from optimizers.utils import adjust_learning_rate
 from helpers.grapher import Grapher
 from helpers.metrics import softmax_accuracy
 from helpers.utils import same_type, ones_like, \
@@ -54,20 +52,14 @@ parser.add_argument('--downsample-scale', type=int, default=7,
 # Model parameters
 parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                     help='input batch size for training (default: 64)')
-parser.add_argument('--activation', type=str, default='identity',
-                    help='default activation function (default: identity)')
-# parser.add_argument('--activation-dense', type=str, default='selu',
-#                     help='activation function for dense layers such as VRNN or classifiers (default: selu)')
-parser.add_argument('--normalization', type=str, default='groupnorm',
-                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
 parser.add_argument('--max-time-steps', type=int, default=4,
                     help='max time steps for RNN (default: 4)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
                     help='isotropic_gaussian, discrete or mixture [default: isotropic_gaussian]')
-parser.add_argument('--layer-type', type=str, default='conv',
-                    help='dense or conv (default: conv)')
+parser.add_argument('--layer-type', type=str, default='dense',
+                    help='dense or conv (default: dense)')
 parser.add_argument('--continuous-size', type=int, default=6,
                     help='continuous latent size (6/2 units of this are used for [s, x, y]) (default: 6)')
 parser.add_argument('--discrete-size', type=int, default=10,
@@ -80,35 +72,16 @@ parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                     help='learning rate (default: 1e-3)')
 parser.add_argument('--vae-type', type=str, default='parallel',
                     help='vae type [sequential or parallel] (default: parallel)')
-parser.add_argument('--use-pixel-cnn-decoder', action='store_true',
-                    help='uses a pixel CNN decoder (default: False)')
-parser.add_argument('--disable-gated', action='store_true',
-                    help='disables gated convolutional or dense structure (default: False)')
+parser.add_argument('--use-relational-encoder', action='store_true',
+                    help='uses a relational network as the encoder projection layer')
 parser.add_argument('--restore', type=str, default=None,
                     help='path to a model to restore (default: None)')
-
-# Regularizer related
-parser.add_argument('--continuous-mut-info', type=float, default=0.0,
-                    help='-continuous_mut_info * I(z_c; x) is applied (opposite dir of disc)(default: 0.0)')
-parser.add_argument('--discrete-mut-info', type=float, default=0.0,
-                    help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
-parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
-                    help='clamp mut info by norm / clamp / none (default: clamp)')
-parser.add_argument('--mut-clamp-value', type=float, default=100.0,
-                    help='max / min clamp value if above strategy is clamp (default: 100.0)')
-parser.add_argument('--monte-carlo-infogain', action='store_true',
-                    help='use the MC version of mutual information gain / false is analytic (default: False)')
-parser.add_argument('--kl-reg', type=float, default=1.0,
-                    help='hyperparameter to scale KL term in ELBO')
-parser.add_argument('--generative-scale-var', type=float, default=1.0,
-                    help='scale variance of prior in order to capture outliers')
+parser.add_argument('--clip', type=float, default=0.25,
+                    help='gradient clipping for RNN (default: 0.25)')
 
 # Optimizer
 parser.add_argument('--optimizer', type=str, default="adamnorm",
                     help="specify optimizer (default: rmsprop)")
-parser.add_argument('--clip', type=float, default=0,
-                    help='gradient clipping for RNN (default: 0.25)')
-
 
 # Visdom parameters
 parser.add_argument('--visdom-url', type=str, default="http://localhost",
@@ -137,14 +110,6 @@ if args.seed is not None:
     numpy.random.seed(args.seed)
     torch.manual_seed_all(args.seed)
 
-# import FP16 optimizer and module
-# if args.half is not None:
-#     from apex import amp
-#     amp_handle = amp.init()
-
-    # from apex.fp16_utils import FP16_Module
-    # from apex.fp16_utils import FP16_Optimizer
-
 
 # Global counter
 TOTAL_ITER = 0
@@ -155,35 +120,25 @@ def build_optimizer(model):
         "rmsprop": optim.RMSprop,
         "adam": optim.Adam,
         "adamnorm": AdamNormGrad,
-        "adamw": AdamW,
         "adadelta": optim.Adadelta,
         "sgd": optim.SGD,
-        "sgd_momentum": lambda params, lr : optim.SGD(params,
-                                                      lr=lr,
-                                                      weight_decay=1e-4,
-                                                      momentum=0.9),
         "lbfgs": optim.LBFGS
     }
     # filt = filter(lambda p: p.requires_grad, model.parameters())
     # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
-    optimizer = optim_map[args.optimizer.lower().strip()](
+    return optim_map[args.optimizer.lower().strip()](
         model.parameters(), lr=args.lr
     )
-    # if args.half:
-    #     return FP16_Optimizer(optimizer)
-
-    return optimizer
 
 
 def register_images(images, names, grapher, prefix="train"):
     ''' helper to register a list of images '''
     if isinstance(images, list):
-        assert len(images) == len(names), "#images[{}] != #names[{}]".format(
-            len(images), len(names))
+        assert len(images) == len(names)
         for im, name in zip(images, names):
             register_images(im, name, grapher, prefix=prefix)
     else:
-        images = torch.min(images.detach(), ones_like(images))
+        images = torch.min(images.detach(), torch.ones_like(images))
         grapher.register_single({'{}_{}'.format(prefix, names): images},
                                 plot_type='imgs')
 
@@ -195,7 +150,7 @@ def register_plots(loss, grapher, epoch, prefix='train'):
 
         if 'mean' in k or 'scalar' in k:
             key_name = k.split('_')[0]
-            value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
+            value = v.data[0] if not isinstance(v, (float, np.float32, np.float64)) else v
             grapher.register_single({'%s_%s' % (prefix, key_name): [[epoch], [value]]},
                                     plot_type='line')
 
@@ -248,10 +203,9 @@ def generate_related(data, args):
 
 def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
-    start_time = time.time()
     model.eval() if not 'train' in prefix else model.train()
     assert optimizer is not None if 'train' in prefix else optimizer is None
-    loss_map, num_samples = {}, 0
+    loss_map, params, num_samples = {}, {}, 0
     x_original, x_related = None, None
 
     for data, labels in data_loader:
@@ -267,65 +221,45 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
         with torch.no_grad() if 'train' not in prefix else dummy_context():
             x_original, x_related = generate_related(data, args)
 
-            # run the VAE + the DNN and gather the loss function
-            output_map = model(x_original, x_related)
-            loss_t = model.loss_function(x_related, labels, output_map)
+            # run the baseline
+            pred_logits = model(x_related)
+            loss_t = {'loss_mean': F.cross_entropy(input=pred_logits, target=labels)}
 
             # compute accuracy and aggregate into map
             loss_t['accuracy_mean'] = softmax_accuracy(
-                F.softmax(output_map['preds'], -1),
+                F.softmax(pred_logits, -1),
                 labels, size_average=True
             )
 
             loss_map = _add_loss_map(loss_map, loss_t)
             num_samples += x_original.size(0)
 
-        if 'train' in prefix:    # compute bp and optimize
-            if args.half:
-            #     optimizer.backward(loss_t['loss_mean'])
-                with amp_handle.scale_loss(loss_t['loss_mean'], optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss_t['loss_mean'].backward()
-
-            if args.clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                               args.clip)
-                # torch.nn.utils.clip_grad_value_(model.parameters(),
-                #                                 args.clip)
-
+        if 'train' in prefix:
+            # compute bp and optimize
+            loss_t['loss_mean'].backward()
             optimizer.step()
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
+    # correct_percent = 100.0 * np.prod([loss_map['accuracy{}_mean'.format(rnn_iter)]
+    #                                    for rnn_iter in range(args.max_time_steps)])
     correct_percent = 100.0 * loss_map['accuracy_mean']
 
-    print('{}[Epoch {}][{} samples][{:.2f} sec]: Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tAcc: {:.4f}'.format(
-        prefix, epoch, num_samples, time.time() - start_time,
+    print('{}[Epoch {}][{} samples]: Average loss: {:.4f}\tAcc: {:.4f}'.format(
+        prefix, epoch, num_samples,
         loss_map['loss_mean'].item(),
-        loss_map['kld_mean'].item(),
-        loss_map['nll_mean'].item(),
         correct_percent))
 
-    # gather scalar values of reparameterizers (if they exist)
-    reparam_scalars = model.vae.get_reparameterizer_scalars()
-
     # plot the test accuracy, loss and images
-    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
+    register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
     images = [data, F.upsample(x_related, (32, 32), mode='bilinear')]
     img_names = ['original_imgs', 'related_imgs']
-    for i, (crop, decoded) in enumerate(zip(output_map['crops'], output_map['decoded'])):
-        images.append(F.upsample(crop, (32, 32), mode='bilinear'))
-        img_names.append('crop_{}'.format(i))
-        images.append(F.upsample(model.vae.nll_activation(decoded),
-                                 (32, 32), mode='bilinear'))
-        img_names.append('decoded_{}'.format(i))
-
     register_images(images, img_names, grapher, prefix=prefix)
     grapher.show()
 
     # return this for early stopping
     loss_val = loss_map['loss_mean'].detach().item()
     loss_map.clear()
+    params.clear()
     return loss_val, correct_percent
 
 
@@ -353,6 +287,8 @@ def set_multigpu(saccader):
     setattr(saccader, 'vae', vae_obj)
     return saccader
 
+def get_name():
+    return "baseline_vgg16bn"
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
@@ -360,41 +296,33 @@ def get_model_and_loader():
 
     # append the image shape to the config & build the VAE
     args.img_shp =  loader.img_shp
-    vae = VRNN(loader.img_shp,
-               latent_size=512,             # XXX: hard coded
-               normalization="batchnorm",  # XXX: hard coded
-               n_layers=1,                 # XXX: hard coded
-               bidirectional=True,        # XXX: hard coded
-               #is_conv_phi=True,           # XXX: hard coded
-               kwargs=vars(args))
+    model = nn.Sequential(
+            BWtoRGB(),
+            nn.Upsample(size=[224, 224], mode='bilinear'),
+            vgg16_bn(num_classes=loader.output_size)
+        )
 
-    # build the Variational Saccading module
-    saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
-    # if args.half:
-    #     name_fn = saccader.get_name
-    #     loss_fn = saccader.loss_function
-    #     conf = saccader.config
-    #     saccader = FP16_Module(saccader.half())
-    #     setattr(saccader, 'get_name', name_fn)
-    #     setattr(saccader, 'loss_function', loss_fn)
-    #     setattr(saccader, 'config', conf)
-
-        # saccader = network_to_half(saccader)
-        # register_nan_checks(saccader)
-
+    # model = nn.Sequential(
+    #         BWtoRGB(),
+    #         nn.Upsample(size=[224, 224], mode='bilinear'),
+    #         resnet18(num_classes=loader.output_size)
+    #     )
     if args.cuda:
-        saccader = saccader.cuda()
+        model = model.cuda()
+
+    if args.half:
+        model = network_to_half(model)
 
     if args.ngpu > 1:
-        saccader = set_multigpu(saccader)
+        model = set_multigpu(model)
 
     # build the grapher object
-    grapher = Grapher(env=saccader.get_name(),
+    grapher = Grapher(env=get_name(),
                       server=args.visdom_url,
                       port=args.visdom_port)
 
     # register_nan_checks(saccader)
-    return [saccader, loader, grapher]
+    return [model, loader, grapher]
 
 
 def lazy_generate_modules(model, img_shp):
@@ -402,11 +330,7 @@ def lazy_generate_modules(model, img_shp):
     model.eval()
     chans = img_shp[0]
     downsampled = same_type(args.half, args.cuda)(args.batch_size, *img_shp).normal_()
-    upsampled = same_type(args.half, args.cuda)(args.batch_size, chans,
-                                                args.upsample_size,
-                                                args.upsample_size).normal_()
-    model(Variable(upsampled), Variable(downsampled))
-    # model = init_weights(model)
+    model(Variable(downsampled))
 
 
 def run(args):
@@ -434,16 +358,12 @@ def run(args):
                 test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
                 break
 
-            # adjust the LR if using momentum sgd
-            if args.optimizer == 'sgd_momentum':
-                adjust_learning_rate(optimizer, args.lr, epoch)
-
         # plot config json to visdom
-        grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.config),
-                         opts=dict(title="config"))
+        # grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.config),
+        #                  opts=dict(title="config"))
         grapher.save() # save to json after distributional interval
     else:
-        assert model.load(args.restore), "Failed to load model"
+        model.load(args.restore)
         test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
 
     # evaluate one-time metrics

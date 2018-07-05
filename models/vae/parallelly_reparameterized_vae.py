@@ -2,10 +2,11 @@ from __future__ import print_function
 import numpy as np
 import torch
 import torch.nn as nn
-from copy import deepcopy
 
+from helpers.layers import str_to_activ_module
 from models.reparameterizers.gumbel import GumbelSoftmax
 from models.reparameterizers.mixture import Mixture
+from models.reparameterizers.beta import Beta
 from models.reparameterizers.isotropic_gaussian import IsotropicGaussian
 from models.vae.abstract_vae import AbstractVAE
 
@@ -13,22 +14,19 @@ from models.vae.abstract_vae import AbstractVAE
 class ParallellyReparameterizedVAE(AbstractVAE):
     ''' This implementation uses a parallel application of
         the reparameterizer via the mixture type. '''
-    def __init__(self, input_shape, output_size,
-                 activation_fn=nn.ELU, **kwargs):
-        super(ParallellyReparameterizedVAE, self).__init__(input_shape,
-                                                           output_size,
-                                                           activation_fn=activation_fn,
-                                                           **kwargs)
+    def __init__(self, input_shape, **kwargs):
+        super(ParallellyReparameterizedVAE, self).__init__(input_shape, **kwargs)
 
         # build the reparameterizer
         if self.config['reparam_type'] == "isotropic_gaussian":
             print("using isotropic gaussian reparameterizer")
             self.reparameterizer = IsotropicGaussian(self.config)
         elif self.config['reparam_type'] == "discrete":
-            raise NotImplementedError("discrete not implemented")
-            # self.config['discrete_size'] = deepcopy(self.input_shape[-2:])
-            # print("using gumbel softmax reparameterizer")
-            # self.reparameterizer = GumbelSoftmax(self.config, dim=1)
+            print("using gumbel softmax reparameterizer")
+            self.reparameterizer = GumbelSoftmax(self.config)
+        elif self.config['reparam_type'] == "beta":
+            print("using beta reparameterizer")
+            self.reparameterizer = Beta(self.config)
         elif self.config['reparam_type'] == "mixture":
             print("using mixture reparameterizer")
             self.reparameterizer = Mixture(num_discrete=self.config['discrete_size'],
@@ -39,7 +37,8 @@ class ParallellyReparameterizedVAE(AbstractVAE):
 
         # build the encoder and decoder
         self.encoder = self.build_encoder()
-        self.decoder = self.build_decoder()
+        if not 'lazy_init_decoder' in kwargs:
+            self.decoder = self.build_decoder()
 
     def get_name(self):
         if self.config['reparam_type'] == "mixture":
@@ -47,7 +46,7 @@ class ParallellyReparameterizedVAE(AbstractVAE):
                 str(self.config['discrete_size']),
                 str(self.config['continuous_size'])
             )
-        elif self.config['reparam_type'] == "isotropic_gaussian":
+        elif self.config['reparam_type'] == "isotropic_gaussian" or self.config['reparam_type'] == "beta":
             reparam_str = "cont{}_".format(str(self.config['continuous_size']))
         elif self.config['reparam_type'] == "discrete":
             reparam_str = "disc{}_".format(str(self.config['discrete_size']))
@@ -71,9 +70,11 @@ class ParallellyReparameterizedVAE(AbstractVAE):
 
         return reparam_scalar_map
 
-    def decode(self, features):
+
+    def decode(self, z):
         '''returns logits '''
-        return self.decoder(features.contiguous())
+        logits = self.decoder(z.contiguous())
+        return self._project_decoder_for_variance(logits)
 
     def posterior(self, x):
         z_logits = self.encode(x)
@@ -86,43 +87,28 @@ class ParallellyReparameterizedVAE(AbstractVAE):
     def encode(self, x):
         ''' encodes via a convolution
             and lazy init's a dense projector'''
-        conv = self.encoder(x)         # do the convolution
+        return self.encoder(x)         # do the convolution
 
-        if self.config['use_relational_encoder']:
-            # build a relational net as the encoder projection
-            self._lazy_init_relational(self.reparameterizer.input_size, name='enc_proj')
-        # else:
-        #     # project via linear layer [if necessary!]
-        #     conv_output_shp = int(np.prod(conv.size()[1:]))
-        #     self._lazy_init_dense(conv_output_shp,
-        #                           num_models*num_meta_model_layers,
-        #                           name='enc_proj')
-
-        # return projected units
-        #return self.enc_proj(conv)#.view(-1, num_meta_model_layers, num_models)
-
-        return conv
-
-    def generate(self, z):
-        ''' reparameterizer for sequential is different '''
-        return self.decode(z)
+    # def generate(self, z):
+    #     ''' reparameterizer for sequential is different '''
+    #     return self.decode(z)
 
     def kld(self, dist_a):
         ''' KL divergence between dist_a and prior '''
-        return torch.sum(self.reparameterizer.kl(dist_a), dim=-1)
+        return self.reparameterizer.kl(dist_a)
 
     def mut_info(self, dist_params):
         ''' helper to get mutual info '''
         mut_info = None
-        if self.config['reparam_type'] == 'mixture' \
-           or self.config['reparam_type'] == 'discrete':
+        if (self.config['continuous_mut_info'] > 0
+             or self.config['discrete_mut_info'] > 0):
+            # only grab the mut-info if the scalars above are set
             mut_info = self.reparameterizer.mutual_info(dist_params)
 
         return mut_info
 
     def loss_function(self, recon_x, x, params):
         ''' evaluates the loss of the model '''
-        #mut_info = self.mut_info(params)
-        mut_info = None
+        mut_info = self.mut_info(params)
         return super(ParallellyReparameterizedVAE, self).loss_function(recon_x, x, params,
                                                                        mut_info=mut_info)

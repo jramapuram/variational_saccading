@@ -25,12 +25,11 @@ class StubReparameterizer(object):
 
 
 class SequentiallyReparameterizedVAE(AbstractVAE):
-    def __init__(self, input_shape, output_size, latent_size, activation_fn=nn.ELU,
-                 reparameterizer_strs=["discrete", "isotropic_gaussian"], **kwargs):
+    def __init__(self,
+                 input_shape,
+                 reparameterizer_strs=["discrete", "isotropic_gaussian"],
+                 **kwargs):
         super(SequentiallyReparameterizedVAE, self).__init__(input_shape,
-                                                             output_size,
-                                                             latent_size=latent_size,
-                                                             activation_fn=activation_fn,
                                                              **kwargs)
 
         # build the sequential set of reparameterizers
@@ -41,7 +40,8 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
 
         # build the encoder and decoder
         self.encoder = self.build_encoder()
-        self.decoder = self.build_decoder()
+        if not 'lazy_init_decoder' in kwargs:
+            self.decoder = self.build_decoder()
 
     def _build_sequential_reparameterizers(self, reparam_str_list):
         ''' helper to build all the reparameterizers '''
@@ -54,6 +54,9 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
             elif reparam_str == "discrete":
                 print("adding gumbel softmax reparameterizer")
                 reparameterizers.append(GumbelSoftmax(self.config))
+            elif self.config['reparam_type'] == "beta":
+                print("adding beta reparameterizer")
+                reparameterizers.append(Beta(self.config))
             elif reparam_str == "mixture":
                 print("adding mixture reparameterizer")
                 reparameterizers.append(Mixture(num_discrete=self.config['discrete_size'],
@@ -62,26 +65,25 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
             else:
                 raise Exception("unknown reparameterization type")
 
-            # the encoder projects to the first reparameterization's
-            # input_size, so tabulate this to use in all the seq models below
-            if encoder_output_size is None:
-                encoder_output_size = reparameterizers[-1].input_size
+            # # the encoder projects to the first reparameterization's
+            # # input_size, so tabulate this to use in all the seq models below
+            # if encoder_output_size is None:
+            #     encoder_output_size = reparameterizers[-1].input_size
 
-            # tweak the reparameterizer to add a dense skip-network
-            # XXX: parameterize the latent size
-            reparameterizers[-1] = nn.Sequential(
-                nn.Linear(encoder_output_size, 512),
-                nn.BatchNorm1d(512),
-                self.activation_fn(),
-                nn.Linear(512, reparameterizers[-1].input_size),
-                reparameterizers[-1]
-            )
+            # # tweak the reparameterizer to add a dense skip-network
+            # reparameterizers[-1] = nn.Sequential(
+            #     build_dense_encoder(encoder_output_size,
+            #                         reparameterizers[-1].input_size, nlayers=2,
+            #                         activation_fn=self.activation_fn,
+            #                         normalization_str=self.config['normalization']),
+            #     reparameterizers[-1]
+            # )
 
-            if self.config['ngpu'] > 1:
-                reparameterizers[-1] = nn.DataParallel(reparameterizers[-1])
+            # if self.config['ngpu'] > 1:
+            #     reparameterizers[-1] = nn.DataParallel(reparameterizers[-1])
 
-            if self.config['cuda']:
-                reparameterizers[-1].cuda()
+            # if self.config['cuda']:
+            #     reparameterizers[-1].cuda()
 
         # a simple struct to hold input and output sizing
         # as well as the first reparameterizer in the chain
@@ -121,6 +123,13 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
 
         return reparam_scalar_map
 
+    def _lazy_init_dense(input_size, output_size, name):
+        if not hasattr(self, name):
+            setattr(self, name,
+                    build_dense_encoder(input_size, output_size,
+                                        nlayers=2, activation_fn=self.activation_fn,
+                                        normalization_str=self.config['normalization']))
+
     def reparameterize(self, z):
         ''' reparameterize the latent logits appropriately '''
         batch_size = z.size(0)
@@ -152,12 +161,12 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
         z, params_map = self.posterior(x)
         return self.decode(z), params_map
 
-    def generate(self, z):
-        ''' given z_0 generate z_1, ... -> decode(z_last) '''
-        for reparameterizer in self.reparameterizers[1:]:
-            z, _ = reparameterizer(z)
+    # def generate(self, z):
+    #     ''' given z_0 generate z_1, ... -> decode(z_last) '''
+    #     for reparameterizer in self.reparameterizers[1:]:
+    #         z, _ = reparameterizer(z)
 
-        return self.decode(z)
+    #     return self.decode(z)
 
     def kld(self, dists):
         ''' does the KL divergence between the posterior and the prior '''
