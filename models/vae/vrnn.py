@@ -52,28 +52,24 @@ class VRNNMemory(nn.Module):
         self.memory_buffer.clear()
 
     def init_state(self, batch_size):
-        num_directions = 2 if self.bidirectional else 1
-        if self.training: # add some noise to initial state
-            self.state = (  # LSTM state is (h, c)
-                # nn.init.xavier_uniform_(
-                same_type(self.config['half'], self.config['cuda'])(
-                    num_directions * self.n_layers, batch_size, self.h_dim
-                ).normal_(0, 0.01).requires_grad_(),
+        def _init(batch_size):
+            ''' return a single initialized state'''
+            num_directions = 2 if self.bidirectional else 1
+            # if self.training: # add some noise to initial state
+            #     # nn.init.xavier_uniform_(
+            #     return same_type(self.config['half'], self.config['cuda'])(
+            #         num_directions * self.n_layers, batch_size, self.h_dim
+            #     ).normal_(0, 0.01).requires_grad_(),
 
-                same_type(self.config['half'], self.config['cuda'])(
-                    num_directions * self.n_layers, batch_size, self.h_dim
-                ).normal_(0, 0.01).requires_grad_()
-            )
-        else: # test time initialize to 0
-            self.state = (  # LSTM state is (h, c)
-                same_type(self.config['half'], self.config['cuda'])(
-                    num_directions * self.n_layers, batch_size, self.h_dim
-                ).zero_().requires_grad_(),
+            # return zeros for testing
+            return same_type(self.config['half'], self.config['cuda'])(
+                num_directions * self.n_layers, batch_size, self.h_dim
+            ).zero_().requires_grad_()
 
-                same_type(self.config['half'], self.config['cuda'])(
-                    num_directions * self.n_layers, batch_size, self.h_dim
-                ).zero_().requires_grad_()
-            )
+        self.state = ( # LSTM state is (h, c)
+            _init(batch_size),
+            _init(batch_size)
+        )
 
     def init_output(self, batch_size, seqlen):
         self.outputs = same_type(self.config['half'], self.config['cuda'])(
@@ -323,6 +319,13 @@ class VRNN(AbstractVAE):
         nan_check_and_break(logits_map['encoder_logits'], "enc_logits")
         nan_check_and_break(logits_map['prior_logits'], "prior_logits")
         z_enc_t, params_enc_t = self.reparameterizer(logits_map['encoder_logits'])
+
+        # XXX: hardcode softplus on prior logits std-dev
+        feat_size = logits_map['prior_logits'].size(-1)
+        logits_map['prior_logits'] = torch.cat(
+            [logits_map['prior_logits'][:, 0:feat_size//2],
+            F.sigmoid(logits_map['prior_logits'][:, feat_size//2:])],
+        -1)
         z_prior_t, params_prior_t = self.reparameterizer(logits_map['prior_logits'])
 
         z = {  # reparameterization
@@ -473,8 +476,8 @@ class VRNN(AbstractVAE):
 
     def kld(self, dist):
         ''' KL divergence between dist_a and prior as well as constrain prior to hyper-prior'''
-        return self.reparameterizer.kl(dist['posterior'], dist['prior']) \
-            + self.reparameterizer.kl(dist['prior']) / self.config['max_time_steps']
+        return self.reparameterizer.kl(dist['posterior'], dist['prior']) # \
+            # + self.reparameterizer.kl(dist['prior']) / self.config['max_time_steps']
 
     # def nll(self, prediction_list, target_list):
     #     prediction_list, target_list = self._ensure_same_size(prediction_list, target_list)

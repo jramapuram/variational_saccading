@@ -190,15 +190,10 @@ class Saccader(nn.Module):
 
     # def _build_loss_decoder(self):
     #     ''' helper function to build convolutional or dense decoder'''
-    #     latent_size = self.vae.memory.h_dim
-    #     decoder = nn.Sequential(
-    #         View([-1, latent_size]),
-    #         nn.Linear(latent_size, 256),
-    #         nn.BatchNorm1d(256),
-    #         nn.SELU(),
-    #         nn.Linear(256, self.output_size)
-    #     )
-
+    #     from helpers.layers import build_dense_encoder
+    #     decoder = build_dense_encoder(self.vae.memory.h_dim,
+    #                                   self.output_size,
+    #                                   normalization_str=self.config['normalization'])
     #     if self.config['cuda']:
     #         decoder = decoder.cuda()
 
@@ -207,11 +202,12 @@ class Saccader(nn.Module):
     def _build_loss_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         from helpers.layers import build_conv_encoder
-        decoder = build_conv_encoder([1, 32, 32], self.output_size)
+        decoder = build_conv_encoder([1, 32, 32], self.output_size, normalization_str=self.config['normalization'])
         if self.config['cuda']:
             decoder = decoder.cuda()
 
         return decoder
+
     def loss_function(self, x, labels, output_map):
         ''' loss is: L_{classifier} * L_{VAE} '''
         vae_loss_map = self.vae.loss_function(output_map['decoded'],
@@ -229,7 +225,7 @@ class Saccader(nn.Module):
         nan_check_and_break(pred_loss, "pred_loss")
 
         # TODO: try multi-task loss
-        vae_loss_map['loss'] = vae_loss_map['loss'] #* pred_loss
+        vae_loss_map['loss'] = vae_loss_map['loss'] * pred_loss
         nan_check_and_break(vae_loss_map['loss'], "full_loss")
         #vae_loss_map['loss'] = self.config['max_time_steps'] * (vae_loss_map['loss'] + pred_loss)
         vae_loss_map['pred_loss_mean'] = torch.mean(pred_loss)

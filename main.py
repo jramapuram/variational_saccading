@@ -42,12 +42,14 @@ parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
 parser.add_argument('--early-stop', action='store_true',
                     help='enable early stopping (default: False)')
-parser.add_argument('--window-size', type=int, default=8,
-                    help='window size for saccades [becomes WxW] (default: 8)')
+
+# handle scaling of images and related imgs
 parser.add_argument('--upsample-size', type=int, default=3840,
                     help='size to upsample image before downsampling to blurry version (default: 3840)')
 parser.add_argument('--max-image-percentage', type=float, default=0.15,
                     help='maximum percentage of the image to look over (default: 0.15)')
+parser.add_argument('--window-size', type=int, default=32,
+                    help='window size for saccades [becomes WxW] (default: 32)')
 parser.add_argument('--downsample-scale', type=int, default=7,
                     help='downscale the image by this scalar, eg: [100 // 8 , 100 // 8] (default: 8)')
 
@@ -361,11 +363,10 @@ def get_model_and_loader():
     # append the image shape to the config & build the VAE
     args.img_shp =  loader.img_shp
     vae = VRNN(loader.img_shp,
-               latent_size=512,             # XXX: hard coded
+               latent_size=512,            # XXX: hard coded
                normalization="batchnorm",  # XXX: hard coded
-               n_layers=1,                 # XXX: hard coded
-               bidirectional=True,        # XXX: hard coded
-               #is_conv_phi=True,           # XXX: hard coded
+               n_layers=2,                 # XXX: hard coded
+               bidirectional=True,         # XXX: hard coded
                kwargs=vars(args))
 
     # build the Variational Saccading module
@@ -423,7 +424,7 @@ def run(args):
     # train the VAE on the same distributions as the model pool
     if args.restore is None:
         print("training current distribution for {} epochs".format(args.epochs))
-        early = EarlyStopping(model, max_steps=80) if args.early_stop else None
+        early = EarlyStopping(model, burn_in_interval=100, max_steps=80) if args.early_stop else None
 
         test_loss, test_acc = 0.0, 0.0
         for epoch in range(1, args.epochs + 1):
