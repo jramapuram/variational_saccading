@@ -8,7 +8,7 @@ from torch.autograd import Variable
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros
-from helpers.layers import View
+from helpers.layers import View, RNNImageClassifier
 
 # the folowing few helpers are from pyro example for AIR
 def ng_ones(*args, **kwargs):
@@ -189,6 +189,20 @@ class Saccader(nn.Module):
             torch.save(self, model_filename)
 
     # def _build_loss_decoder(self):
+    #     decoder = RNNImageClassifier(self.config['img_shp'], self.output_size,
+    #                                  bias=True,
+    #                                  bidirectional=False,
+    #                                  rnn_type='lstm',
+    #                                  dropout=0,
+    #                                  cuda=self.config['cuda'],
+    #                                  half=self.config['half'],
+    #                                  normalization_str=self.config['normalization'])
+    #     # if self.config['cuda']:
+    #     #     decoder = decoder.cuda()
+
+    #     return decoder
+
+    # def _build_loss_decoder(self):
     #     ''' helper function to build convolutional or dense decoder'''
     #     from helpers.layers import build_dense_encoder
     #     decoder = build_dense_encoder(self.vae.memory.h_dim,
@@ -202,7 +216,8 @@ class Saccader(nn.Module):
     def _build_loss_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         from helpers.layers import build_conv_encoder
-        decoder = build_conv_encoder([1, 32, 32], self.output_size, normalization_str=self.config['normalization'])
+        decoder = build_conv_encoder(self.config['img_shp'], self.output_size,
+                                     normalization_str=self.config['normalization'])
         if self.config['cuda']:
             decoder = decoder.cuda()
 
@@ -268,9 +283,13 @@ class Saccader(nn.Module):
                               cuda=self.config['cuda'],
                               dtype='float32' if not self.config['half'] else 'float16')
 
+            x_preds = zeros((batch_size, self.output_size),
+                            cuda=self.config['cuda'],
+                            dtype='float32' if not self.config['half'] else 'float16')
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
-                z_t, params_t = self.vae.posterior(x_related, x_trunc_t)
+                # z_t, params_t = self.vae.posterior(x_related, x_trunc_t)
+                z_t, params_t = self.vae.posterior(x_related)
 
                 nan_check_and_break(z_t['prior'], "prior")
                 nan_check_and_break(z_t['posterior'], "posterior")
@@ -279,6 +298,10 @@ class Saccader(nn.Module):
                 # extract the required crop from original image
                 x_trunc_t = self._z_to_image(z_t['posterior'], x)
                 nan_check_and_break(x_trunc_t, "x_trunc_t")
+
+                # do preds and sum
+                x_preds += self.loss_decoder(x_trunc_t)
+                #self.loss_decoder.forward_rnn(x_trunc_t, reset_state=i==0)
 
                 # decode the posterior
                 # produce_outputs = (i == self.config['max_time_steps'] - 1)
@@ -299,6 +322,7 @@ class Saccader(nn.Module):
             return {
                 'decoded': decodes,
                 'params': params,
+                'preds': x_preds,
                 'crops': crops
             }
 
@@ -319,11 +343,13 @@ class Saccader(nn.Module):
                 }
 
         # do the classifier predictions
-        standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
-            #self.vae.memory.get_merged_memory()
-            #torch.mean(self.vae.memory.get_state()[0], 0)
-            standard_forward_pass['crops'][0]
-        )
+        # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
+        #     #self.vae.memory.get_merged_memory()
+        #     #torch.mean(self.vae.memory.get_state()[0], 0)
+        #     standard_forward_pass['crops'][0]
+        # )
+        # standard_forward_pass['preds'] \
+        #     = self.loss_decoder.forward_prediction()
         self.vae.memory.clear()
 
         # return both the standard forward pass and the mut-info one
