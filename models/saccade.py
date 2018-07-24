@@ -9,6 +9,8 @@ from torch.autograd import Variable
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros
 from helpers.layers import View, RNNImageClassifier
+from .relational_network import RelationalNetwork
+
 
 # the folowing few helpers are from pyro example for AIR
 def ng_ones(*args, **kwargs):
@@ -84,7 +86,14 @@ def window_to_image(z_where, window_size, image_size, windows):
 
 
 def image_to_window(z_where, window_size, images, max_image_percentage=0.15):
-    ''' max_percentage is the maximum scale possible for the window '''
+    ''' max_percentage is the maximum scale possible for the window
+
+        example sizes:
+            grid=  torch.Size([300, 32, 32, 2])  | images =  torch.Size([300, 1, 64, 64])
+            theta_inv =  torch.Size([300, 2, 3])
+            nonzero grid =  tensor(0, device='cuda:0')
+    '''
+
     n, image_size = images.size(0), list(images.size())[1:]
     assert images.size(2) == images.size(3) == image_size[1] == image_size[2], 'Size mismatch.'
     max_scale = image_size[1] / (image_size[1] * max_image_percentage)
@@ -143,14 +152,16 @@ def image_to_window_discrete(z_where, window_size, image_size, images, scale=Non
 
 
 class Saccader(nn.Module):
-    def __init__(self, vae, output_size, **kwargs):
+    def __init__(self, vae, output_size, latent_size=256, **kwargs):
         super(Saccader, self).__init__()
         self.vae = vae
+        self.latent_size = latent_size
         self.output_size = output_size
         self.config = kwargs['kwargs']
 
         # build the projection to softmax from RNN state
-        self.loss_decoder = self._build_loss_decoder()
+        self.loss_decoder, self.projector = self._build_loss_decoder()
+        # self.loss_decoder = self._build_loss_decoder()
 
     def get_name(self):
         return "{}_win{}_us{}_dscale{}_{}".format(
@@ -196,7 +207,8 @@ class Saccader(nn.Module):
     #                                  dropout=0,
     #                                  cuda=self.config['cuda'],
     #                                  half=self.config['half'],
-    #                                  normalization_str=self.config['normalization'])
+    #                                  dense_normalization_str='batchnorm',
+    #                                  conv_normalization_str=self.config['normalization'])
     #     # if self.config['cuda']:
     #     #     decoder = decoder.cuda()
 
@@ -213,15 +225,39 @@ class Saccader(nn.Module):
 
     #     return decoder
 
+    # def _build_loss_decoder(self):
+    #     ''' helper function to build convolutional or dense decoder
+    #         chans * 2 because we want to do relationships'''
+    #     # def __init__(self, hidden_size, output_size, config):
+    #     decoder = RelationalNetwork(hidden_size=self.latent_size,
+    #                                 output_size=self.output_size,
+    #                                 config=self.config)
+    #     # if self.config['cuda']:
+    #     #     decoder = decoder.cuda()
+
+    #     return decoder
+
     def _build_loss_decoder(self):
-        ''' helper function to build convolutional or dense decoder'''
-        from helpers.layers import build_conv_encoder
-        decoder = build_conv_encoder(self.config['img_shp'], self.output_size,
-                                     normalization_str=self.config['normalization'])
+        ''' helper function to build convolutional or dense decoder
+            chans * 2 because we want to do relationships'''
+        from helpers.layers import build_conv_encoder, build_dense_encoder
+        crop_size = [self.config['img_shp'][0],
+                     self.config['window_size'],
+                     self.config['window_size']]
+
+        builder_fn = build_dense_encoder \
+                if self.config['layer_type'] == 'dense' else build_conv_encoder
+        decoder = nn.Sequential(
+            builder_fn(crop_size, self.latent_size,
+                       normalization_str=self.config['normalization']),
+            nn.SELU()
+        )
+        projector = build_dense_encoder(self.latent_size, self.output_size,
+                                        normalization_str='batchnorm')#self.config['normalization'])
         if self.config['cuda']:
             decoder = decoder.cuda()
 
-        return decoder
+        return decoder, projector
 
     def loss_function(self, x, labels, output_map):
         ''' loss is: L_{classifier} * L_{VAE} '''
@@ -283,9 +319,11 @@ class Saccader(nn.Module):
                               cuda=self.config['cuda'],
                               dtype='float32' if not self.config['half'] else 'float16')
 
-            x_preds = zeros((batch_size, self.output_size),
+            # accumulator for predictions
+            x_preds = zeros((batch_size, self.latent_size),
                             cuda=self.config['cuda'],
                             dtype='float32' if not self.config['half'] else 'float16')
+
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
                 # z_t, params_t = self.vae.posterior(x_related, x_trunc_t)
@@ -301,7 +339,8 @@ class Saccader(nn.Module):
 
                 # do preds and sum
                 x_preds += self.loss_decoder(x_trunc_t)
-                #self.loss_decoder.forward_rnn(x_trunc_t, reset_state=i==0)
+
+                # self.loss_decoder.forward_rnn(x_trunc_t, reset_state=i==0)
 
                 # decode the posterior
                 # produce_outputs = (i == self.config['max_time_steps'] - 1)
@@ -317,12 +356,11 @@ class Saccader(nn.Module):
                 crops.append(x_trunc_t)
                 decodes.append(decoded_t)
 
-            # print("# decodes = {} | #crops = {}".format(len(decodes), len(crops)))
-            # exit(0)
+            preds = self.projector(x_preds / self.config['max_time_steps'])
             return {
                 'decoded': decodes,
                 'params': params,
-                'preds': x_preds,
+                'preds': preds,
                 'crops': crops
             }
 
@@ -344,13 +382,20 @@ class Saccader(nn.Module):
 
         # do the classifier predictions
         # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
+        #     standard_forward_pass['crops']
+        # )
+
+        # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
         #     #self.vae.memory.get_merged_memory()
         #     #torch.mean(self.vae.memory.get_state()[0], 0)
         #     standard_forward_pass['crops'][0]
         # )
+
         # standard_forward_pass['preds'] \
         #     = self.loss_decoder.forward_prediction()
-        self.vae.memory.clear()
+
 
         # return both the standard forward pass and the mut-info one
+        # after clearing the cached memory
+        self.vae.memory.clear()
         return standard_forward_pass

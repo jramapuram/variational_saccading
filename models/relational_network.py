@@ -8,91 +8,60 @@ from torch.autograd import Variable
 
 from helpers.utils import to_data, expand_dims, \
     int_type, float_type, long_type, add_weight_norm
-
+from helpers.layers import build_conv_encoder, build_dense_encoder
 
 class RelationalNetwork(nn.Module):
-    def __init__(self, hidden_size, output_size, cuda=False, ngpu=1):
+    def __init__(self, hidden_size, output_size, config):
+        ''' Relational network that takes a list of imgs, projects
+            each with a conv and then take each i-j tuple and runs an RN
+            over it. Finally, the model returns a DNN over the summed
+            values of the RN.
+        '''
         super(RelationalNetwork, self).__init__()
-        self.use_cuda = cuda
-        self.ngpu = ngpu
+        self.config = config
         self.hidden_size = hidden_size
         self.output_size = output_size
 
-        # build the final combined projector module
+        # build the projector and the rn models
         self.proj = self._build_proj_model()
+        self.rn = self._build_rn_model()
 
     def _build_proj_model(self):
-        proj = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.BatchNorm1d(self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.BatchNorm1d(self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.output_size),
-        )
+        return build_dense_encoder(self.hidden_size, self.output_size,
+                                   normalization_str='batchnorm')#self.config['normalization'])
 
-        if self.ngpu > 1:
-            proj = nn.DataParallel(proj)
+    def _lazy_build_image_model(self, input_size):
+        if not hasattr(self, 'conv'):
+            builder_fn = build_dense_encoder \
+                if self.config['layer_type'] == 'dense' else build_conv_encoder
+            self.img_model =  nn.Sequential(
+                builder_fn(input_size, self.hidden_size,
+                           normalization_str=self.config['normalization']),
+                nn.SELU())
 
-        if self.use_cuda:
-            proj = proj.cuda()
+            if self.config['cuda']:
+                self.img_model = self.img_model.cuda()
 
-        return proj
+        return self.img_model
 
-    def _lazy_generate_rn(self, input_size, latent_size, output_size):
-        if not hasattr(self, 'rn'):
-            self.rn = nn.Sequential(
-                nn.Linear(input_size, self.hidden_size),
-                nn.BatchNorm2d(latent_size),  # Input: :math:`(N, C, H, W)`
-                nn.ReLU(),
-                nn.Linear(self.hidden_size, self.hidden_size),
-                #nn.BatchNorm1d(self.hidden_size),
-                nn.BatchNorm2d(latent_size),
-                nn.ReLU(),
-                nn.Linear(self.hidden_size, output_size),
-                nn.ReLU()
-            )
+    def _build_rn_model(self):
+        return nn.Sequential(
+            build_dense_encoder(self.hidden_size*2, self.hidden_size,
+                                normalization_str='batchnorm'),#self.config['normalization']),
+            nn.SELU())
 
-            if self.ngpu > 1:
-                self.rn = nn.DataParallel(self.rn)
+    def forward(self, imgs):
+        assert type(imgs) == list, "need a set of input images"
 
-            if self.use_cuda:
-                self.rn = self.rn.cuda()
+        # get all the conv outputs
+        self._lazy_build_image_model(list(imgs[0].size())[1:])
+        conv_output = [self.img_model(img) for img in imgs]
 
+        # project each x_i : x_j tuple through the RN
+        rn_buffer = [self.rn(torch.cat([img_r, img_l], -1)).unsqueeze(0)
+                     for img_r in conv_output
+                     for img_l in conv_output]
+        rn_buffer = torch.mean(torch.cat(rn_buffer, 0), 0)
 
-    def forward(self, conv_output):
-        batch_size, conv_chan_size, _, _ = list(conv_output.size())
-        conv_output = conv_output.view(batch_size, conv_chan_size, -1) # convert to [B, C, -1]
-        num_feat = conv_output.size(-1)
-
-        rn_buffer = [] # container to hold the tuples
-
-        for i in range(num_feat): # run over all features (the -1 from view above)
-            chunk_i = conv_output[:, :, i].contiguous()
-
-            # for j in range(i+1, num_chans):
-            for j in range(num_feat): # run over all features (the -1 from view above)
-                chunk_j = conv_output[:, :, j].contiguous()
-
-                # flatten the chunks and merge them together
-                chunk_i = chunk_i.view(batch_size, 1, -1)  # eg: [100, 1, 24]
-                chunk_j = chunk_j.view(batch_size, 1, -1)  # eg: [100, 1, 24]
-                merged = torch.cat([chunk_i, chunk_j], -1) # eg: [100, 1, 48]
-                rn_buffer.append(merged)
-
-        # aggregate the buffer
-        rn_buffer = torch.cat(rn_buffer, 1)
-
-        # expand the second to last dimension
-        rn_buffer = expand_dims(rn_buffer, 2) # eg: [100, 81, 1, 48]
-
-        # generate the relational network lazily
-        self._lazy_generate_rn(input_size=rn_buffer.size(-1),
-                               latent_size=rn_buffer.size(1),  # for BN [uses 2d BN over channels]
-                               output_size=self.hidden_size)
-
-        # squeeze, reduce over the concatenations and project
-        rbo = torch.squeeze(self.rn(rn_buffer)) # eg: [100, 81, 128], does batch-matmul
-        rn_output = torch.sum(rbo, 1) # eg: [100, 128]
-        return self.proj(rn_output) # eg: [100, 2]
+        # return the summed buffer projected through a DNN
+        return self.proj(rn_buffer)

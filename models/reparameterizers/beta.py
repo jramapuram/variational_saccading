@@ -1,3 +1,5 @@
+# coding: utf-8
+
 from __future__ import print_function
 import numpy as np
 import torch
@@ -33,16 +35,16 @@ class Beta(nn.Module):
                 batch_size, self.output_size
             ).zero_() + 1/3
         )
-        #beta = D.Beta(conc1.cpu(), conc2.cpu()).sample()
-        #return beta.cuda() if self.config['cuda'] else beta
         return D.Beta(conc1, conc2).sample()
 
     def _reparametrize_beta(self, conc1, conc2):
         if self.training:
-            # pytorch < 0.5 doesn't have beta rsample()
-            # beta_cpu = D.Beta(conc1.cpu(), conc2.cpu()).rsample()
-            # beta = beta_cpu.cuda() if self.config['cuda'] else beta_cpu
-            beta = D.Beta(conc1, conc2).rsample()
+            # rsample is CPU only ¯\_(ツ)_/¯ , but ok
+            # because it is outside the computational graph
+            beta_cpu = D.Beta(conc1.cpu(), conc2.cpu()).rsample()
+            beta = beta_cpu.cuda() if self.config['cuda'] else beta_cpu
+            # once we have GPU rsample just use the following:
+            # beta = D.Beta(conc1, conc2).rsample()
             return beta, {'conc1': conc1, 'conc2': conc2}
 
         return D.Beta(conc1, conc2).mean, {'conc1': conc1, 'conc2': conc2}
@@ -66,7 +68,7 @@ class Beta(nn.Module):
         prior = D.Beta(zeros_like(conc1) + 1/3,
                        zeros_like(conc2) + 1/3)
         beta = D.Beta(conc1, conc2)
-        return D.kl_divergence(beta, prior)
+        return torch.sum(D.kl_divergence(beta, prior), -1)
 
     def kl(self, dist_a, prior=None):
         if prior == None:  # use standard reparamterizer
@@ -75,10 +77,11 @@ class Beta(nn.Module):
             )
 
         # we have two distributions provided (eg: VRNN)
-        return D.kl_divergence(
+        return torch.sum(D.kl_divergence(
             D.Beta(dist_a['beta']['conc1'], dist_a['beta']['conc2']),
             D.Beta(prior['beta']['conc1'], prior['beta']['conc2'])
-        )
+        ), -1)
+
 
     def mutual_info(self, params, eps=1e-9):
         # I(z_d; x) ~ H(z_prior, z_d) + H(z_prior)

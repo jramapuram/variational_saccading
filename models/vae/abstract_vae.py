@@ -10,7 +10,7 @@ from helpers.utils import float_type
 from helpers.layers import View, flatten_layers, Identity, \
     build_gated_conv_encoder, build_conv_encoder, build_dense_encoder, build_gated_dense_encoder, \
     build_gated_conv_decoder, build_conv_decoder, build_dense_decoder, build_gated_dense_decoder, \
-    build_relational_conv_encoder, build_pixelcnn_decoder, str_to_activ_module
+    build_relational_conv_encoder, build_pixelcnn_decoder, add_normalization, str_to_activ_module
 from helpers.distributions import nll_activation as nll_activation_fn
 from helpers.distributions import nll as nll_fn
 
@@ -177,7 +177,8 @@ class AbstractVAE(nn.Module):
             if not hasattr(self, 'decoder_projector'):
                 if self.config['layer_type'] == 'conv':
                     self.decoder_projector = nn.Sequential(
-                        add_normalization(Identity(), self.config['normalization'], 2, self.chans, num_groups=32),
+                        #TODO: caused error with groupnorm w/ 32 
+                        #add_normalization(Identity(), self.config['normalization'], 2, self.chans, num_groups=32),
                         self.activation_fn(),
                         nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
                     )
@@ -246,8 +247,8 @@ class AbstractVAE(nn.Module):
         return self.decode(z), params
 
     def loss_function(self, recon_x, x, params, mut_info=None):
-        # tf: elbo = -log_likelihood + latent_kl
-        # tf: cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
+        # elbo = -log_likelihood + latent_kl
+        # cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
         nll = nll_fn(x, recon_x, self.config['nll_type'])
         kld = self.config['kl_reg'] * self.kld(params)
         elbo = nll + kld

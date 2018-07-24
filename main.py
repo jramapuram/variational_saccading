@@ -2,6 +2,7 @@ import time
 import argparse
 import numpy as np
 import pprint
+import torchvision
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -54,20 +55,12 @@ parser.add_argument('--downsample-scale', type=int, default=7,
                     help='downscale the image by this scalar, eg: [100 // 8 , 100 // 8] (default: 8)')
 
 # Model parameters
-parser.add_argument('--batch-size', type=int, default=64, metavar='N',
-                    help='input batch size for training (default: 64)')
 parser.add_argument('--activation', type=str, default='identity',
                     help='default activation function (default: identity)')
-# parser.add_argument('--activation-dense', type=str, default='selu',
-#                     help='activation function for dense layers such as VRNN or classifiers (default: selu)')
-parser.add_argument('--normalization', type=str, default='groupnorm',
-                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
-parser.add_argument('--max-time-steps', type=int, default=4,
-                    help='max time steps for RNN (default: 4)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
-parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
-                    help='isotropic_gaussian, discrete or mixture [default: isotropic_gaussian]')
+parser.add_argument('--reparam-type', type=str, default='beta',
+                    help='isotropic_gaussian / discrete / beta / mixture (default: beta)')
 parser.add_argument('--layer-type', type=str, default='conv',
                     help='dense or conv (default: conv)')
 parser.add_argument('--continuous-size', type=int, default=6,
@@ -76,18 +69,20 @@ parser.add_argument('--discrete-size', type=int, default=10,
                     help='discrete latent size (only used for mix + disc) (default: 10)')
 parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
-parser.add_argument('--mut-reg', type=float, default=0.3,
-                    help='mutual information regularizer [mixture only] (default: 0.3)')
-parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
-                    help='learning rate (default: 1e-3)')
-parser.add_argument('--vae-type', type=str, default='parallel',
-                    help='vae type [sequential or parallel] (default: parallel)')
+parser.add_argument('--vae-type', type=str, default='vrnn',
+                    help='vae type [sequential / parallel / vrnn] (default: parallel)')
 parser.add_argument('--use-pixel-cnn-decoder', action='store_true',
                     help='uses a pixel CNN decoder (default: False)')
 parser.add_argument('--disable-gated', action='store_true',
                     help='disables gated convolutional or dense structure (default: False)')
 parser.add_argument('--restore', type=str, default=None,
                     help='path to a model to restore (default: None)')
+
+# RNN related
+parser.add_argument('--use-noisy-rnn-state', action='store_true',
+                    help='uses a noisy initial rnn state instead of zeros (default: False)')
+parser.add_argument('--max-time-steps', type=int, default=4,
+                    help='max time steps for RNN (default: 4)')
 
 # Regularizer related
 parser.add_argument('--continuous-mut-info', type=float, default=0.0,
@@ -100,17 +95,24 @@ parser.add_argument('--mut-clamp-value', type=float, default=100.0,
                     help='max / min clamp value if above strategy is clamp (default: 100.0)')
 parser.add_argument('--monte-carlo-infogain', action='store_true',
                     help='use the MC version of mutual information gain / false is analytic (default: False)')
+parser.add_argument('--mut-reg', type=float, default=0.3,
+                    help='mutual information regularizer [mixture only] (default: 0.3)')
 parser.add_argument('--kl-reg', type=float, default=1.0,
                     help='hyperparameter to scale KL term in ELBO')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
                     help='scale variance of prior in order to capture outliers')
+parser.add_argument('--normalization', type=str, default='groupnorm',
+                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
 
 # Optimizer
+parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                    help='input batch size for training (default: 64)')
+parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
+                    help='learning rate (default: 1e-3)')
 parser.add_argument('--optimizer', type=str, default="adamnorm",
                     help="specify optimizer (default: rmsprop)")
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping for RNN (default: 0.25)')
-
 
 # Visdom parameters
 parser.add_argument('--visdom-url', type=str, default="http://localhost",
@@ -140,12 +142,12 @@ if args.seed is not None:
     torch.manual_seed_all(args.seed)
 
 # import FP16 optimizer and module
-# if args.half is not None:
-#     from apex import amp
-#     amp_handle = amp.init()
+if args.half:
+    from apex import amp
+    amp_handle = amp.init()
 
-    # from apex.fp16_utils import FP16_Module
-    # from apex.fp16_utils import FP16_Optimizer
+    from apex.fp16_utils import FP16_Module
+    from apex.fp16_utils import FP16_Optimizer
 
 
 # Global counter
@@ -171,8 +173,8 @@ def build_optimizer(model):
     optimizer = optim_map[args.optimizer.lower().strip()](
         model.parameters(), lr=args.lr
     )
-    # if args.half:
-    #     return FP16_Optimizer(optimizer)
+    if args.half:
+        return FP16_Optimizer(optimizer)
 
     return optimizer
 
@@ -240,12 +242,22 @@ def _mean_map(loss_map):
 def generate_related(data, args):
     # first upsample the image and then downsample the upsampled version
     # this creates a 'blurry' related image making the problem tougher
-    x_enlarged = F.upsample(data, (args.upsample_size, args.upsample_size), mode='bilinear')
-    original_img_size = tuple(data.size()[-2:])                                                  # eg: [100, 100]
-    ds_img_size = tuple(int(i) for i in np.asarray(original_img_size) // args.downsample_scale)  # eg: [12, 12]
-    x_downsampled = F.upsample(F.upsample(data, ds_img_size, mode='bilinear'), # blur the crap out
-                               original_img_size, mode='bilinear')             # of the original data
-    return x_enlarged, x_downsampled
+    original_img_size = tuple(data.size()[-2:])
+    ds_img_size = tuple(int(i) for i in np.asarray([32, 32]) // args.downsample_scale)  # eg: [12, 12]
+    downsampled = F.upsample(
+        F.upsample(data, ds_img_size, mode='bilinear'),
+        (32, 32), mode='bilinear')
+    return data, downsampled
+
+# def generate_related(data, args):
+#     # first upsample the image and then downsample the upsampled version
+#     # this creates a 'blurry' related image making the problem tougher
+#     x_enlarged = F.upsample(data, (args.upsample_size, args.upsample_size), mode='bilinear')
+#     original_img_size = tuple(data.size()[-2:])                                                  # eg: [100, 100]
+#     ds_img_size = tuple(int(i) for i in np.asarray(original_img_size) // args.downsample_scale)  # eg: [12, 12]
+#     x_downsampled = F.upsample(F.upsample(data, ds_img_size, mode='bilinear'), # blur the crap out
+#                                original_img_size, mode='bilinear')             # of the original data
+#     return x_enlarged, x_downsampled
 
 
 def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
@@ -313,7 +325,8 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
 
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-    images = [data, F.upsample(x_related, (32, 32), mode='bilinear')]
+    images = [F.upsample(data, (32, 32), mode='bilinear'),
+              F.upsample(x_related, (32, 32), mode='bilinear')]
     img_names = ['original_imgs', 'related_imgs']
     for i, (crop, decoded) in enumerate(zip(output_map['crops'], output_map['decoded'])):
         images.append(F.upsample(crop, (32, 32), mode='bilinear'))
@@ -358,11 +371,12 @@ def set_multigpu(saccader):
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
-    loader = get_loader(args, sequentially_merge_test=False)
+    resize_transform = [torchvision.transforms.Resize((args.upsample_size, args.upsample_size))]
+    loader = get_loader(args, transform=resize_transform, sequentially_merge_test=False)
 
     # append the image shape to the config & build the VAE
-    args.img_shp =  loader.img_shp
-    vae = VRNN(loader.img_shp,
+    args.img_shp = loader.img_shp
+    vae = VRNN([loader.img_shp[0], 32, 32], #loader.img_shp,
                latent_size=512,            # XXX: hard coded
                normalization="batchnorm",  # XXX: hard coded
                n_layers=2,                 # XXX: hard coded
@@ -371,16 +385,16 @@ def get_model_and_loader():
 
     # build the Variational Saccading module
     saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
-    # if args.half:
-    #     name_fn = saccader.get_name
-    #     loss_fn = saccader.loss_function
-    #     conf = saccader.config
-    #     saccader = FP16_Module(saccader.half())
-    #     setattr(saccader, 'get_name', name_fn)
-    #     setattr(saccader, 'loss_function', loss_fn)
-    #     setattr(saccader, 'config', conf)
+    if args.half:
+        name_fn = saccader.get_name
+        loss_fn = saccader.loss_function
+        conf = saccader.config
+        saccader = FP16_Module(saccader.half())
+        setattr(saccader, 'get_name', name_fn)
+        setattr(saccader, 'loss_function', loss_fn)
+        setattr(saccader, 'config', conf)
 
-        # saccader = network_to_half(saccader)
+        saccader = network_to_half(saccader)
         # register_nan_checks(saccader)
 
     if args.cuda:
@@ -416,7 +430,7 @@ def run(args):
 
     # since some modules are lazy generated
     # we want to run a single fwd pass
-    lazy_generate_modules(model, args.img_shp)
+    lazy_generate_modules(model, [args.img_shp[0], 32, 32])#args.img_shp)
 
     # collect our optimizer
     optimizer = build_optimizer(model)

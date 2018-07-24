@@ -55,11 +55,11 @@ class VRNNMemory(nn.Module):
         def _init(batch_size):
             ''' return a single initialized state'''
             num_directions = 2 if self.bidirectional else 1
-            # if self.training: # add some noise to initial state
-            #     # nn.init.xavier_uniform_(
-            #     return same_type(self.config['half'], self.config['cuda'])(
-            #         num_directions * self.n_layers, batch_size, self.h_dim
-            #     ).normal_(0, 0.01).requires_grad_(),
+            if self.training and self.config['use_noisy_rnn_state']: # add some noise to initial state
+                # nn.init.xavier_uniform_(
+                return same_type(self.config['half'], self.config['cuda'])(
+                    num_directions * self.n_layers, batch_size, self.h_dim
+                ).normal_(0, 0.01).requires_grad_()
 
             # return zeros for testing
             return same_type(self.config['half'], self.config['cuda'])(
@@ -476,8 +476,8 @@ class VRNN(AbstractVAE):
 
     def kld(self, dist):
         ''' KL divergence between dist_a and prior as well as constrain prior to hyper-prior'''
-        return self.reparameterizer.kl(dist['posterior'], dist['prior']) # \
-            # + self.reparameterizer.kl(dist['prior']) / self.config['max_time_steps']
+        return self.reparameterizer.kl(dist['posterior'], dist['prior'])  # \
+             # + self.reparameterizer.kl(dist['prior']) / self.config['max_time_steps']
 
     # def nll(self, prediction_list, target_list):
     #     prediction_list, target_list = self._ensure_same_size(prediction_list, target_list)
