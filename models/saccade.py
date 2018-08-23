@@ -7,10 +7,11 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from helpers.utils import expand_dims, check_or_create_dir, \
-    zeros_like, int_type, nan_check_and_break, zeros
+    zeros_like, int_type, nan_check_and_break, zeros, get_dtype
 from helpers.layers import View, RNNImageClassifier
 from .relational_network import RelationalNetwork
-
+from .image_state_projector import ImageStateProjector
+from datasets.crop_dual_imagefolder import CropLambdaPool
 
 # the folowing few helpers are from pyro example for AIR
 def ng_ones(*args, **kwargs):
@@ -74,7 +75,6 @@ def z_where_inv(z_where, clip_scale=5.0):
 
     # out = out / z_where[:, 0:1]
     return out
-
 
 def window_to_image(z_where, window_size, image_size, windows):
     n = windows.size(0)
@@ -152,22 +152,32 @@ def image_to_window_discrete(z_where, window_size, image_size, images, scale=Non
 
 
 class Saccader(nn.Module):
-    def __init__(self, vae, output_size, latent_size=256, **kwargs):
+    def __init__(self, vae, output_size, latent_size=512, **kwargs):
         super(Saccader, self).__init__()
         self.vae = vae
         self.latent_size = latent_size
         self.output_size = output_size
         self.config = kwargs['kwargs']
 
+        # build the pool object
+        self.pool = CropLambdaPool(self.config['batch_size'])
+
         # build the projection to softmax from RNN state
-        self.loss_decoder, self.projector = self._build_loss_decoder()
+        #self.loss_decoder, self.projector = self._build_loss_decoder()
         # self.loss_decoder = self._build_loss_decoder()
+        self.latent_projector = ImageStateProjector(latent_size=self.latent_size,
+                                                    output_size=self.output_size,
+                                                    config=self.config)
+
+    def parallel(self):
+        self.latent_projector.parallel()
+        self.vae.parallel()
 
     def get_name(self):
         return "{}_win{}_us{}_dscale{}_{}".format(
             str(self.config['uid']),
             str(self.config['window_size']),
-            str(self.config['upsample_size']),
+            str(self.config['synthetic_upsample_size']) if self.config['synthetic_upsample_size'] > 0 else "",
             str(self.config['downsample_scale']),
             self.vae.get_name()
         )
@@ -237,27 +247,27 @@ class Saccader(nn.Module):
 
     #     return decoder
 
-    def _build_loss_decoder(self):
-        ''' helper function to build convolutional or dense decoder
-            chans * 2 because we want to do relationships'''
-        from helpers.layers import build_conv_encoder, build_dense_encoder
-        crop_size = [self.config['img_shp'][0],
-                     self.config['window_size'],
-                     self.config['window_size']]
+    # def _build_loss_decoder(self):
+    #     ''' helper function to build convolutional or dense decoder
+    #         chans * 2 because we want to do relationships'''
+    #     from helpers.layers import build_conv_encoder, build_dense_encoder
+    #     crop_size = [self.config['img_shp'][0],
+    #                  self.config['window_size'],
+    #                  self.config['window_size']]
 
-        builder_fn = build_dense_encoder \
-                if self.config['layer_type'] == 'dense' else build_conv_encoder
-        decoder = nn.Sequential(
-            builder_fn(crop_size, self.latent_size,
-                       normalization_str=self.config['normalization']),
-            nn.SELU()
-        )
-        projector = build_dense_encoder(self.latent_size, self.output_size,
-                                        normalization_str='batchnorm')#self.config['normalization'])
-        if self.config['cuda']:
-            decoder = decoder.cuda()
+    #     builder_fn = build_dense_encoder \
+    #             if self.config['layer_type'] == 'dense' else build_conv_encoder
+    #     decoder = nn.Sequential(
+    #         builder_fn(crop_size, self.latent_size,
+    #                    normalization_str=self.config['normalization']),
+    #         nn.SELU()
+    #     )
+    #     projector = build_dense_encoder(self.latent_size + self.latent_size, self.output_size,
+    #                                     normalization_str='batchnorm')#self.config['normalization'])
+    #     if self.config['cuda']:
+    #         decoder = decoder.cuda()
 
-        return decoder, projector
+    #     return decoder, projector
 
     def loss_function(self, x, labels, output_map):
         ''' loss is: L_{classifier} * L_{VAE} '''
@@ -283,46 +293,62 @@ class Saccader(nn.Module):
         vae_loss_map['loss_mean'] = torch.mean(vae_loss_map['loss'])
         return vae_loss_map
 
+    def _z_to_image_transformer(self, z, imgs):
+        return image_to_window(z[:, 0:3], self.config['window_size'],
+                               imgs, max_image_percentage=self.config['max_image_percentage'])
+
+    def _z_to_image_bounding_box(self, z, imgs):
+        img_size = list(imgs.size())[1:]
+        return image_to_window_continuous(z[:, 0:3], self.config['window_size'] // 2,
+                                          images=imgs, cuda=self.config['cuda'])
+
+    def _z_to_image_lambda(self, z, imgs):
+        crops = torch.cat(self.pool(imgs, z.clone().detach().cpu().numpy()), 0)
+        crops = crops.cuda() if z.is_cuda else crops
+        return crops
+
+        # z = torch.from_numpy(np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        #                              (crops.shape[0], 1)))
+        # z = z.cuda() if self.config['cuda'] else z
+        # return self._z_to_image_transformer(z, crops)
+
     def _z_to_image(self, z, imgs):
-        ''' accepts images and z (gauss or disc)
+        ''' accepts images (or lambdas to crop) and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
         if self.config['reparam_type'] == 'discrete':
             raise NotImplementedError
-        elif self.config['reparam_type']== 'isotropic_gaussian' \
-             or self.config['reparam_type']== 'mixture' \
-             or self.config['reparam_type']== 'beta':
-            assert z.size()[-1] >= 3, "z needs to be [scale, x, y]"
-            #img_size = list(imgs.size())[1:]
-            # return image_to_window_continuous(z[:, 0:3], self.config['window_size'] // 2,
-            #                                   images=imgs, cuda=self.config['cuda'])
-            return image_to_window(z[:, 0:3], self.config['window_size'],
-                                   imgs, max_image_percentage=self.config['max_image_percentage'])
-        else:
-            raise Exception("{} reparameterizer not supported".format(
-                self.config['reparam_type']
-            ))
+
+        assert z.size()[-1] >= 3, "z needs to be at least [scale, x, y]"
+        assert len(imgs) == z.shape[0], "batch sizes for crop preds vs imgs dont match"
+        crop_fn_map = {
+            'transformer': self._z_to_image_transformer,
+            'lambda': self._z_to_image_lambda,
+            'bounding': self._z_to_image_bounding_box # TODO: will we ever use this?
+        }
+        crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
+        return crop_fn_map[crop_type](z, imgs)
 
     def forward(self, x, x_related):
         ''' encode with VAE, then use posterior sample to
             gather image from original space (eg: 4k image) '''
-        batch_size, chans = x.size(0), x.size(1)
+        batch_size, chans = x_related.size(0), x_related.size(1)
 
         def _forward_internal(x_related, inference_only=False):
             params, crops, decodes = [], [], []
 
             # reset the state, output and the truncate window
-            self.vae.memory.init_state(x.size(0))
-            self.vae.memory.init_output(x.size(0), seqlen=1)
+            self.vae.memory.init_state(batch_size, cuda=x_related.is_cuda)
+            self.vae.memory.init_output(batch_size, seqlen=1, cuda=x_related.is_cuda)
             x_trunc_t = zeros((batch_size, chans,
                                self.config['window_size'],
                                self.config['window_size']),
-                              cuda=self.config['cuda'],
-                              dtype='float32' if not self.config['half'] else 'float16')
+                              cuda=x_related.is_cuda,
+                              dtype=get_dtype(x_related))
 
             # accumulator for predictions
             x_preds = zeros((batch_size, self.latent_size),
-                            cuda=self.config['cuda'],
-                            dtype='float32' if not self.config['half'] else 'float16')
+                            cuda=x_related.is_cuda,
+                            dtype=get_dtype(x_related))
 
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
@@ -338,7 +364,9 @@ class Saccader(nn.Module):
                 nan_check_and_break(x_trunc_t, "x_trunc_t")
 
                 # do preds and sum
-                x_preds += self.loss_decoder(x_trunc_t)
+                #x_preds += self.loss_decoder(x_trunc_t)
+                state = torch.mean(self.vae.memory.get_state()[0], 0)
+                x_preds += self.latent_projector(x_trunc_t, state)
 
                 # self.loss_decoder.forward_rnn(x_trunc_t, reset_state=i==0)
 
@@ -356,7 +384,14 @@ class Saccader(nn.Module):
                 crops.append(x_trunc_t)
                 decodes.append(decoded_t)
 
-            preds = self.projector(x_preds / self.config['max_time_steps'])
+            #preds = self.projector(x_preds / self.config['max_time_steps'])
+
+            #state = torch.mean(self.vae.memory.get_state()[0], 0)
+            # state = self.vae.memory.get_merged_memory()
+            # preds = self.projector(
+            #     torch.cat([x_preds / self.config['max_time_steps'], state], -1)
+            # )
+            preds = self.latent_projector.get_output(x_preds / self.config['max_time_steps'])
             return {
                 'decoded': decodes,
                 'params': params,
@@ -379,6 +414,24 @@ class Saccader(nn.Module):
                     **param['posterior'],
                     'q_z_given_xhat': q_z_given_xhat_param['posterior']
                 }
+
+        # def recurse(m):
+        #     for k, v in m.items():
+        #         if isinstance(v, map):
+        #             print("{} is a map, recusing".format(k))
+        #             recursive(m)
+
+        #         print("key = ", k, " # = ", len(v))
+        #         def sec_recurse(l):
+        #             for item in l:
+        #                 if isinstance(item, list):
+        #                     sec_recurse(item)
+
+        #                 print(type(item))
+
+        #         sec_recurse(v)
+
+        # recurse(standard_forward_pass)
 
         # do the classifier predictions
         # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error

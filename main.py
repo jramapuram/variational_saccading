@@ -32,9 +32,10 @@ parser = argparse.ArgumentParser(description='Variational Saccading')
 # Task parameters
 parser.add_argument('--uid', type=str, default="",
                     help="add a custom task-specific unique id; appended to name (default: None)")
-parser.add_argument('--task', type=str, default="mnist",
+parser.add_argument('--task', type=str, default="crop_dual_imagefolder",
                     help="""task to work on (can specify multiple) [mnist / cifar10 /
-                    fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
+                    fashion / svhn_centered / svhn / clutter /
+                    permuted / crop_dual_imagefolder] (default: crop_dual_imagefolder)""")
 parser.add_argument('--epochs', type=int, default=2000, metavar='N',
                     help='minimum number of epochs to train (default: 2000)')
 parser.add_argument('--download', type=int, default=1,
@@ -45,8 +46,9 @@ parser.add_argument('--early-stop', action='store_true',
                     help='enable early stopping (default: False)')
 
 # handle scaling of images and related imgs
-parser.add_argument('--upsample-size', type=int, default=3840,
-                    help='size to upsample image before downsampling to blurry version (default: 3840)')
+parser.add_argument('--synthetic-upsample-size', type=int, default=0,
+                    help="""size to upsample image before downsampling to
+                    blurry version for synthetic problems (default: 0)""")
 parser.add_argument('--max-image-percentage', type=float, default=0.15,
                     help='maximum percentage of the image to look over (default: 0.15)')
 parser.add_argument('--window-size', type=int, default=32,
@@ -60,7 +62,7 @@ parser.add_argument('--activation', type=str, default='identity',
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='beta',
-                    help='isotropic_gaussian / discrete / beta / mixture (default: beta)')
+                    help='isotropic_gaussian / discrete / beta / mixture / beta_mixture (default: beta)')
 parser.add_argument('--layer-type', type=str, default='conv',
                     help='dense or conv (default: conv)')
 parser.add_argument('--continuous-size', type=int, default=6,
@@ -109,8 +111,8 @@ parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                     help='input batch size for training (default: 64)')
 parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                     help='learning rate (default: 1e-3)')
-parser.add_argument('--optimizer', type=str, default="adamnorm",
-                    help="specify optimizer (default: rmsprop)")
+parser.add_argument('--optimizer', type=str, default="adam",
+                    help="specify optimizer (default: adam)")
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping for RNN (default: 0.25)')
 
@@ -239,7 +241,11 @@ def _mean_map(loss_map):
     return loss_map
 
 
-def generate_related(data, args):
+def generate_related(data, x_original, args):
+    # handle logic for crop-image-loader
+    if x_original is not None:
+        return x_original, data
+
     # first upsample the image and then downsample the upsampled version
     # this creates a 'blurry' related image making the problem tougher
     original_img_size = tuple(data.size()[-2:])
@@ -247,18 +253,37 @@ def generate_related(data, args):
     downsampled = F.upsample(
         F.upsample(data, ds_img_size, mode='bilinear'),
         (32, 32), mode='bilinear')
+    data = F.upsample(data, (args.synthetic_upsample_size,
+                             args.synthetic_upsample_size), mode='bilinear')
     return data, downsampled
 
-# def generate_related(data, args):
-#     # first upsample the image and then downsample the upsampled version
-#     # this creates a 'blurry' related image making the problem tougher
-#     x_enlarged = F.upsample(data, (args.upsample_size, args.upsample_size), mode='bilinear')
-#     original_img_size = tuple(data.size()[-2:])                                                  # eg: [100, 100]
-#     ds_img_size = tuple(int(i) for i in np.asarray(original_img_size) // args.downsample_scale)  # eg: [12, 12]
-#     x_downsampled = F.upsample(F.upsample(data, ds_img_size, mode='bilinear'), # blur the crap out
-#                                original_img_size, mode='bilinear')             # of the original data
-#     return x_enlarged, x_downsampled
 
+def _unpack_data_and_labels(item):
+    ''' helper to unpack the data and the labels
+        in the presence of a lambda cropper '''
+    if isinstance(item[-1], list):    # crop-dual loader logic
+        x_original, (x_related, label) = item
+    elif isinstance(item[0], list):   # multi-imagefolder logic
+        assert len(item[0]) == 2, \
+            "multi-image-folder [{} #datasets] unpack > 2 datasets not impl".format(len(item[0]))
+        (x_related, x_original), label = item
+    else:                             # standard loader
+        x_related, label = item
+        x_original = None
+
+    return x_original, x_related, label
+
+def cudaize(tensor, is_data_tensor=False):
+    if isinstance(tensor, list):
+        return tensor
+
+    if args.half and is_data_tensor:
+        tensor = tensor.half()
+
+    if args.cuda:
+        tensor = tensor.cuda()
+
+    return tensor
 
 def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
@@ -268,18 +293,17 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
     loss_map, num_samples = {}, 0
     x_original, x_related = None, None
 
-    for data, labels in data_loader:
-        data = Variable(data).cuda() if args.cuda else Variable(data)
-        labels = Variable(labels).cuda() if args.cuda else Variable(labels)
-        if args.half:
-            data = data.half()
+    for item in data_loader:
+        # first destructure the data and cuda-ize and wrap in vars
+        x_original, x_related, labels = _unpack_data_and_labels(item)
+        x_related, labels = cudaize(x_related, is_data_tensor=True), cudaize(labels)
 
-        if 'train' in prefix:
-            # zero gradients on optimizer
+        if 'train' in prefix:  # zero gradients on optimizer
             optimizer.zero_grad()
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
-            x_original, x_related = generate_related(data, args)
+            x_original, x_related = generate_related(x_related, x_original, args)
+            x_original = cudaize(x_original, is_data_tensor=True)
 
             # run the VAE + the DNN and gather the loss function
             output_map = model(x_original, x_related)
@@ -292,7 +316,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
             )
 
             loss_map = _add_loss_map(loss_map, loss_t)
-            num_samples += x_original.size(0)
+            num_samples += x_related.size(0)
 
         if 'train' in prefix:    # compute bp and optimize
             if args.half:
@@ -325,9 +349,17 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
 
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-    images = [F.upsample(data, (32, 32), mode='bilinear'),
-              F.upsample(x_related, (32, 32), mode='bilinear')]
-    img_names = ['original_imgs', 'related_imgs']
+    images = [F.upsample(x_related, (32, 32), mode='bilinear')]
+    img_names = ['related_imgs']
+    if isinstance(x_original, torch.Tensor):
+        images.append(F.upsample(x_original, (32, 32), mode='bilinear'))
+    else:
+        z = np.tile(np.array([[1.0, 0.0, 0.0]]), (x_related.shape[0], 1))
+        images.append(torch.cat([F.upsample(x_original[i](z_i, override=True), (32, 32), mode='bilinear')
+                                 for i, z_i in enumerate(z)]))
+
+    img_names.append('original_imgs')
+
     for i, (crop, decoded) in enumerate(zip(output_map['crops'], output_map['decoded'])):
         images.append(F.upsample(crop, (32, 32), mode='bilinear'))
         img_names.append('crop_{}'.format(i))
@@ -371,8 +403,10 @@ def set_multigpu(saccader):
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
-    resize_transform = [torchvision.transforms.Resize((args.upsample_size, args.upsample_size))]
-    loader = get_loader(args, transform=resize_transform, sequentially_merge_test=False)
+    loader = get_loader(args, transform=None, sequentially_merge_test=False,
+                        window_size=args.window_size,
+                        max_img_percent=args.max_image_percentage,
+                        postfix="_large")
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
@@ -385,6 +419,8 @@ def get_model_and_loader():
 
     # build the Variational Saccading module
     saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
+    lazy_generate_modules(saccader, loader.train_loader)
+
     if args.half:
         name_fn = saccader.get_name
         loss_fn = saccader.loss_function
@@ -400,8 +436,10 @@ def get_model_and_loader():
     if args.cuda:
         saccader = saccader.cuda()
 
+    # if args.ngpu > 1:
+    #     saccader = set_multigpu(saccader)
     if args.ngpu > 1:
-        saccader = set_multigpu(saccader)
+        saccader.parallel()
 
     # build the grapher object
     grapher = Grapher(env=saccader.get_name(),
@@ -412,16 +450,41 @@ def get_model_and_loader():
     return [saccader, loader, grapher]
 
 
-def lazy_generate_modules(model, img_shp):
+def lazy_generate_modules(model, loader):
     ''' Super hax, but needed for building lazy modules '''
     model.eval()
-    chans = img_shp[0]
-    downsampled = same_type(args.half, args.cuda)(args.batch_size, *img_shp).normal_()
-    upsampled = same_type(args.half, args.cuda)(args.batch_size, chans,
-                                                args.upsample_size,
-                                                args.upsample_size).normal_()
-    model(Variable(upsampled), Variable(downsampled))
-    # model = init_weights(model)
+    for item in loader:
+        # first destructure the data and cuda-ize and wrap in vars
+        x_original, x_related, _ = _unpack_data_and_labels(item)
+        #x_related = cudaize(x_related, is_data_tensor=True)
+        x_original, x_related = generate_related(x_related, x_original, args)
+        #x_original = cudaize(x_original, is_data_tensor=True)
+        _ = model(x_original, x_related)
+        break
+
+    #model = init_weights(model)
+
+# def lbda_fn(z):
+#     chans = args.img_shp[0]
+#     return torch.from_numpy(np.random.rand(1, chans,
+#                                            args.window_size,
+#                                            args.window_size).astype(np.float32))
+
+# def lazy_generate_modules(model):
+#     ''' Super hax, but needed for building lazy modules '''
+#     model.eval()
+#     chans = args.img_shp[0]
+#     x_related = Variable(same_type(args.half, args.cuda)(args.batch_size, *args.img_shp).normal_())
+#     if args.synthetic_upsample_size > 0: # handle the synthetic case
+#         x_original = Variable(same_type(args.half, args.cuda)(args.batch_size, chans,
+#                                                               args.synthetic_upsample_size,
+#                                                               args.synthetic_upsample_size).normal_())
+#     else: # handle the case with true lambdas
+#         # don't use actual lambdas here because of multiprocessing
+#         x_original = [lbda_fn for _ in range(args.batch_size)]
+
+#     model(x_original, x_related)
+#     # model = init_weights(model)
 
 
 def run(args):
@@ -430,7 +493,8 @@ def run(args):
 
     # since some modules are lazy generated
     # we want to run a single fwd pass
-    lazy_generate_modules(model, [args.img_shp[0], 32, 32])#args.img_shp)
+    # lazy_generate_modules(model, loader.train_loader)
+    # lazy_generate_modules(model)
 
     # collect our optimizer
     optimizer = build_optimizer(model)
