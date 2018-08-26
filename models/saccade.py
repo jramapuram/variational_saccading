@@ -8,7 +8,7 @@ from torch.autograd import Variable
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros, get_dtype
-from helpers.layers import View, RNNImageClassifier
+from helpers.layers import View
 from .relational_network import RelationalNetwork
 from .image_state_projector import ImageStateProjector
 from datasets.crop_dual_imagefolder import CropLambdaPool
@@ -70,7 +70,7 @@ def z_where_inv(z_where, clip_scale=5.0):
         print("tensor scale of {} dim was 0!!".format(scale.shape))
         exit(-1)
 
-    nan_check_and_break(scale, "scale")
+    # nan_check_and_break(scale, "scale")
     out = out / scale
 
     # out = out / z_where[:, 0:1]
@@ -102,37 +102,6 @@ def image_to_window(z_where, window_size, images, max_image_percentage=0.15):
     out = F.grid_sample(images.view(n, *image_size), grid)
     return out
 
-
-def image_to_window_continuous(z_where, window_radius_size, images, clip_scale=2.0,
-                               clip_window_radius=4, eps=1e-5, cuda=False):
-    ''' simply takes scale and expands window (placed on z_where[:, 1:]) upto that range '''
-    img_x_size, img_y_size = list(images.size())[2:]
-    scale = torch.clamp(z_where[:, 0:1], -clip_scale, clip_scale) + eps
-    window_radius_size_mod = torch.ceil(window_radius_size * torch.abs(scale)).type(int_type(cuda))
-    window_radius_size_mod = torch.max(window_radius_size_mod, zeros_like(window_radius_size_mod) + clip_window_radius)
-    # print("scale = ", scale, " | window_radius_size_mod = ", window_radius_size_mod)
-    x, y = (z_where[:, 1] * img_x_size).type(int_type(cuda)), \
-           (z_where[:, 2] * img_y_size).type(int_type(cuda))
-    x_offset_min, x_offset_max = window_radius_size_mod + 1, img_x_size - window_radius_size_mod - 1
-    y_offset_min, y_offset_max = window_radius_size_mod + 1, img_y_size - window_radius_size_mod - 1
-    # print('x = ', x, " | y = ", y, " | xmin = ", x_offset_min, " | xmax = ",
-    #       x_offset_max, " | ymin = ", y_offset_min, " | ymax = ", y_offset_max)
-    x = torch.cat([torch.clamp(xi, x_offset_min_i.data[0], x_offset_max_i.data[0])
-                   for xi, x_offset_min_i, x_offset_max_i in zip(x, x_offset_min, x_offset_max)], 0)
-    y = torch.cat([torch.clamp(yi, y_offset_min_i.data[0], y_offset_max_i.data[0])
-                   for yi, y_offset_min_i, y_offset_max_i in zip(y, y_offset_min, y_offset_max)], 0)
-
-    # print("x fixed = ", x, " | y fixed = ", y)
-    # print("imgs = ", images.size(), " img[0] = ", images[0].size())
-
-    crops = [img[:, xi.data[0] - wi.data[0] : xi.data[0] + wi.data[0],
-                 yi.data[0] - wi.data[0] : yi.data[0] + wi.data[0]]
-             for img, wi, xi, yi in zip(images, window_radius_size_mod.squeeze(), x, y)]
-    # print("crops = ", [c.unsqueeze(0).size() for c in crops])
-    return torch.cat([F.upsample(img.unsqueeze(0), (window_radius_size, window_radius_size), mode='bilinear')
-                      for img in crops], 0)
-
-
 def image_to_window_discrete(z_where, window_size, image_size, images, scale=None):
     n = images.size(0)
     assert images.size(2) == images.size(3) == image_size[1] == image_size[2], 'Size mismatch.'
@@ -163,8 +132,6 @@ class Saccader(nn.Module):
         self.pool = CropLambdaPool(self.config['batch_size'])
 
         # build the projection to softmax from RNN state
-        #self.loss_decoder, self.projector = self._build_loss_decoder()
-        # self.loss_decoder = self._build_loss_decoder()
         self.latent_projector = ImageStateProjector(latent_size=self.latent_size,
                                                     output_size=self.output_size,
                                                     config=self.config)
@@ -209,66 +176,6 @@ class Saccader(nn.Module):
             print("saving existing saccader model")
             torch.save(self, model_filename)
 
-    # def _build_loss_decoder(self):
-    #     decoder = RNNImageClassifier(self.config['img_shp'], self.output_size,
-    #                                  bias=True,
-    #                                  bidirectional=False,
-    #                                  rnn_type='lstm',
-    #                                  dropout=0,
-    #                                  cuda=self.config['cuda'],
-    #                                  half=self.config['half'],
-    #                                  dense_normalization_str='batchnorm',
-    #                                  conv_normalization_str=self.config['normalization'])
-    #     # if self.config['cuda']:
-    #     #     decoder = decoder.cuda()
-
-    #     return decoder
-
-    # def _build_loss_decoder(self):
-    #     ''' helper function to build convolutional or dense decoder'''
-    #     from helpers.layers import build_dense_encoder
-    #     decoder = build_dense_encoder(self.vae.memory.h_dim,
-    #                                   self.output_size,
-    #                                   normalization_str=self.config['normalization'])
-    #     if self.config['cuda']:
-    #         decoder = decoder.cuda()
-
-    #     return decoder
-
-    # def _build_loss_decoder(self):
-    #     ''' helper function to build convolutional or dense decoder
-    #         chans * 2 because we want to do relationships'''
-    #     # def __init__(self, hidden_size, output_size, config):
-    #     decoder = RelationalNetwork(hidden_size=self.latent_size,
-    #                                 output_size=self.output_size,
-    #                                 config=self.config)
-    #     # if self.config['cuda']:
-    #     #     decoder = decoder.cuda()
-
-    #     return decoder
-
-    # def _build_loss_decoder(self):
-    #     ''' helper function to build convolutional or dense decoder
-    #         chans * 2 because we want to do relationships'''
-    #     from helpers.layers import build_conv_encoder, build_dense_encoder
-    #     crop_size = [self.config['img_shp'][0],
-    #                  self.config['window_size'],
-    #                  self.config['window_size']]
-
-    #     builder_fn = build_dense_encoder \
-    #             if self.config['layer_type'] == 'dense' else build_conv_encoder
-    #     decoder = nn.Sequential(
-    #         builder_fn(crop_size, self.latent_size,
-    #                    normalization_str=self.config['normalization']),
-    #         nn.SELU()
-    #     )
-    #     projector = build_dense_encoder(self.latent_size + self.latent_size, self.output_size,
-    #                                     normalization_str='batchnorm')#self.config['normalization'])
-    #     if self.config['cuda']:
-    #         decoder = decoder.cuda()
-
-    #     return decoder, projector
-
     def loss_function(self, x, labels, output_map):
         ''' loss is: L_{classifier} * L_{VAE} '''
         vae_loss_map = self.vae.loss_function(output_map['decoded'],
@@ -283,12 +190,12 @@ class Saccader(nn.Module):
             target=labels,
             reduce=False
         )
-        nan_check_and_break(pred_loss, "pred_loss")
+        # nan_check_and_break(pred_loss, "pred_loss")
 
         # TODO: try multi-task loss
         vae_loss_map['loss'] = vae_loss_map['loss'] * pred_loss
-        nan_check_and_break(vae_loss_map['loss'], "full_loss")
-        #vae_loss_map['loss'] = self.config['max_time_steps'] * (vae_loss_map['loss'] + pred_loss)
+        # nan_check_and_break(vae_loss_map['loss'], "full_loss")
+        # vae_loss_map['loss'] = self.config['max_time_steps'] * (vae_loss_map['loss'] + pred_loss)
         vae_loss_map['pred_loss_mean'] = torch.mean(pred_loss)
         vae_loss_map['loss_mean'] = torch.mean(vae_loss_map['loss'])
         return vae_loss_map
@@ -307,11 +214,6 @@ class Saccader(nn.Module):
         crops = crops.cuda() if z.is_cuda else crops
         return crops
 
-        # z = torch.from_numpy(np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
-        #                              (crops.shape[0], 1)))
-        # z = z.cuda() if self.config['cuda'] else z
-        # return self._z_to_image_transformer(z, crops)
-
     def _z_to_image(self, z, imgs):
         ''' accepts images (or lambdas to crop) and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
@@ -322,11 +224,21 @@ class Saccader(nn.Module):
         assert len(imgs) == z.shape[0], "batch sizes for crop preds vs imgs dont match"
         crop_fn_map = {
             'transformer': self._z_to_image_transformer,
-            'lambda': self._z_to_image_lambda,
-            'bounding': self._z_to_image_bounding_box # TODO: will we ever use this?
+            'lambda': self._z_to_image_lambda
         }
         crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
         return crop_fn_map[crop_type](z, imgs)
+
+    def generate(self, batch_size):
+        self.eval()
+        samples = []
+        with torch.no_grad():
+            for i in range(self.config['max_time_steps']):
+                samples.append(
+                    self.vae.generate_synthetic_samples(batch_size, reset_state=i==0)
+                )
+
+        return samples
 
     def forward(self, x, x_related):
         ''' encode with VAE, then use posterior sample to
@@ -352,9 +264,9 @@ class Saccader(nn.Module):
 
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
-                # z_t, params_t = self.vae.posterior(x_related, x_trunc_t)
                 z_t, params_t = self.vae.posterior(x_related)
 
+                nan_check_and_break(x_related, "x_related")
                 nan_check_and_break(z_t['prior'], "prior")
                 nan_check_and_break(z_t['posterior'], "posterior")
                 nan_check_and_break(z_t['x_features'], "x_features")
@@ -364,18 +276,10 @@ class Saccader(nn.Module):
                 nan_check_and_break(x_trunc_t, "x_trunc_t")
 
                 # do preds and sum
-                #x_preds += self.loss_decoder(x_trunc_t)
                 state = torch.mean(self.vae.memory.get_state()[0], 0)
                 x_preds += self.latent_projector(x_trunc_t, state)
 
-                # self.loss_decoder.forward_rnn(x_trunc_t, reset_state=i==0)
-
                 # decode the posterior
-                # produce_outputs = (i == self.config['max_time_steps'] - 1)
-                # produce_outputs = produce_outputs and not inference_only
-                # decoded_t = self.vae.decode(z_t, produce_output=produce_outputs)
-                # if decoded_t is not None:
-                #     nan_check_and_break(decoded_t, "decoded_t")
                 decoded_t = self.vae.decode(z_t, produce_output=True)
                 nan_check_and_break(decoded_t, "decoded_t")
 
@@ -384,13 +288,6 @@ class Saccader(nn.Module):
                 crops.append(x_trunc_t)
                 decodes.append(decoded_t)
 
-            #preds = self.projector(x_preds / self.config['max_time_steps'])
-
-            #state = torch.mean(self.vae.memory.get_state()[0], 0)
-            # state = self.vae.memory.get_merged_memory()
-            # preds = self.projector(
-            #     torch.cat([x_preds / self.config['max_time_steps'], state], -1)
-            # )
             preds = self.latent_projector.get_output(x_preds / self.config['max_time_steps'])
             return {
                 'decoded': decodes,
@@ -414,39 +311,6 @@ class Saccader(nn.Module):
                     **param['posterior'],
                     'q_z_given_xhat': q_z_given_xhat_param['posterior']
                 }
-
-        # def recurse(m):
-        #     for k, v in m.items():
-        #         if isinstance(v, map):
-        #             print("{} is a map, recusing".format(k))
-        #             recursive(m)
-
-        #         print("key = ", k, " # = ", len(v))
-        #         def sec_recurse(l):
-        #             for item in l:
-        #                 if isinstance(item, list):
-        #                     sec_recurse(item)
-
-        #                 print(type(item))
-
-        #         sec_recurse(v)
-
-        # recurse(standard_forward_pass)
-
-        # do the classifier predictions
-        # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
-        #     standard_forward_pass['crops']
-        # )
-
-        # standard_forward_pass['preds'] = self.loss_decoder(  # get classification error
-        #     #self.vae.memory.get_merged_memory()
-        #     #torch.mean(self.vae.memory.get_state()[0], 0)
-        #     standard_forward_pass['crops'][0]
-        # )
-
-        # standard_forward_pass['preds'] \
-        #     = self.loss_decoder.forward_prediction()
-
 
         # return both the standard forward pass and the mut-info one
         # after clearing the cached memory

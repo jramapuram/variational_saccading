@@ -29,10 +29,12 @@ def get_rand_hyperparameters():
         'visdom-url': 'http://neuralnetworkart.com', # FIXED
         'visdom-port': 8098,                         # FIXED
         'max-image-percentage': np.random.choice([0.15, 0.2, 0.3, 0.35]),
-        'normalization': np.random.choice(['batchnorm', 'groupnorm', 'none']),
+        'dense-normalization': np.random.choice(['batchnorm', 'none']),
+        'conv-normalization': np.random.choice(['groupnorm', 'batchnorm', 'none']),
         'batch-size': np.random.choice([32, 64, 128, 256]),
         'reparam-type': np.random.choice(['mixture', 'isotropic_gaussian']),
-        'layer-type': np.random.choice(['conv', 'dense']),
+        'encoder-layer-type': np.random.choice(['conv', 'dense']),
+        'decoder-layer-type': np.random.choice(['conv', 'dense']),
         'discrete-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
         'continuous-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
         'optimizer': np.random.choice(['adam', 'rmsprop', 'sgd_momentum']),

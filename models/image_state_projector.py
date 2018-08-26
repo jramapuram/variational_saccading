@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 
-from helpers.layers import View, build_dense_encoder, build_conv_encoder
+from helpers.layers import View, RNNImageClassifier, \
+    build_dense_encoder, build_conv_encoder
 
 
 class ImageStateProjector(nn.Module):
@@ -35,23 +36,23 @@ class ImageStateProjector(nn.Module):
 
         # main function approximator to decode the crop
         builder_fn = build_dense_encoder \
-                if self.config['layer_type'] == 'dense' else build_conv_encoder
+                if self.config['encoder_layer_type'] == 'dense' else build_conv_encoder
+        normalization = self.config['dense_normalization'] if self.config['encoder_layer_type'] == 'dense' \
+            else self.config['conv_normalization']
         decoder = nn.Sequential(
             builder_fn(crop_size, self.latent_size,
-                       normalization_str=self.config['normalization']),
+                       normalization_str=normalization),
             # nn.SELU()# ,
-            #nn.Dropout(p=0.5)
         )
 
         # takes the state + output of conv and projects it
         state_projector = nn.Sequential(
             build_dense_encoder(self.latent_size + self.latent_size, self.latent_size,
-                                normalization_str='batchnorm'),
+                                normalization_str=self.config['dense_normalization']),
             # nn.SELU()# ,
-            # nn.Dropout(p=0.5)
         )
 
         # takes the finally aggregated vector and projects to output dims
         output_projector = build_dense_encoder(self.latent_size, self.output_size,
-                                               normalization_str='batchnorm')
+                                               normalization_str=self.config['dense_normalization'])
         return decoder, state_projector, output_projector

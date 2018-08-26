@@ -7,7 +7,6 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
-
 from copy import deepcopy
 from torch.autograd import Variable
 
@@ -63,8 +62,10 @@ parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='beta',
                     help='isotropic_gaussian / discrete / beta / mixture / beta_mixture (default: beta)')
-parser.add_argument('--layer-type', type=str, default='conv',
+parser.add_argument('--encoder-layer-type', type=str, default='conv',
                     help='dense or conv (default: conv)')
+parser.add_argument('--decoder-layer-type', type=str, default='conv',
+                    help='dense or conv or pixelcnn (default: conv)')
 parser.add_argument('--continuous-size', type=int, default=6,
                     help='continuous latent size (6/2 units of this are used for [s, x, y]) (default: 6)')
 parser.add_argument('--discrete-size', type=int, default=10,
@@ -73,8 +74,6 @@ parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--vae-type', type=str, default='vrnn',
                     help='vae type [sequential / parallel / vrnn] (default: parallel)')
-parser.add_argument('--use-pixel-cnn-decoder', action='store_true',
-                    help='uses a pixel CNN decoder (default: False)')
 parser.add_argument('--disable-gated', action='store_true',
                     help='disables gated convolutional or dense structure (default: False)')
 parser.add_argument('--restore', type=str, default=None,
@@ -103,8 +102,10 @@ parser.add_argument('--kl-reg', type=float, default=1.0,
                     help='hyperparameter to scale KL term in ELBO')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
                     help='scale variance of prior in order to capture outliers')
-parser.add_argument('--normalization', type=str, default='groupnorm',
+parser.add_argument('--conv-normalization', type=str, default='groupnorm',
                     help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
+parser.add_argument('--dense-normalization', type=str, default='batchnorm',
+                    help='normalization type: batchnorm/instancenorm/none (default: batchnorm)')
 
 # Optimizer
 parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -151,7 +152,6 @@ if args.half:
     from apex.fp16_utils import FP16_Module
     from apex.fp16_utils import FP16_Optimizer
 
-
 # Global counter
 TOTAL_ITER = 0
 
@@ -192,6 +192,7 @@ def register_images(images, names, grapher, prefix="train"):
         images = torch.min(images.detach(), ones_like(images))
         grapher.register_single({'{}_{}'.format(prefix, names): images},
                                 plot_type='imgs')
+
 
 def register_plots(loss, grapher, epoch, prefix='train'):
     ''' helper to register all plots with *_mean and *_scalar '''
@@ -273,6 +274,7 @@ def _unpack_data_and_labels(item):
 
     return x_original, x_related, label
 
+
 def cudaize(tensor, is_data_tensor=False):
     if isinstance(tensor, list):
         return tensor
@@ -284,6 +286,7 @@ def cudaize(tensor, is_data_tensor=False):
         tensor = tensor.cuda()
 
     return tensor
+
 
 def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
@@ -355,8 +358,10 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
         images.append(F.upsample(x_original, (32, 32), mode='bilinear'))
     else:
         z = np.tile(np.array([[1.0, 0.0, 0.0]]), (x_related.shape[0], 1))
-        images.append(torch.cat([F.upsample(x_original[i](z_i, override=True), (32, 32), mode='bilinear')
-                                 for i, z_i in enumerate(z)]))
+        images.append(
+            torch.cat([F.upsample(x_original[i](z_i, override=True), (32, 32), mode='bilinear')
+                       for i, z_i in enumerate(z)])
+        )
 
     img_names.append('original_imgs')
 
@@ -369,6 +374,11 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
 
     register_images(images, img_names, grapher, prefix=prefix)
     grapher.show()
+
+    # delete the data instances, see https://tinyurl.com/ycjre67m
+    images.clear(), img_names.clear()
+    output_map.clear(), reparam_scalars.clear()
+    del x_related, x_original, labels
 
     # return this for early stopping
     loss_val = loss_map['loss_mean'].detach().item()
@@ -388,19 +398,6 @@ def test(epoch, model, loader, grapher, prefix='test'):
                           grapher, prefix='test')
 
 
-def set_multigpu(saccader):
-    ''' workaround for multi-gpu: needs members set '''
-    print("NOTE: multi-gpu currently doesnt over much better perf")
-    name_fn = saccader.get_name
-    loss_fn = saccader.loss_function
-    vae_obj = saccader.vae
-    saccader = nn.DataParallel(saccader)
-    setattr(saccader, 'get_name', name_fn)
-    setattr(saccader, 'loss_function', loss_fn)
-    setattr(saccader, 'vae', vae_obj)
-    return saccader
-
-
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     loader = get_loader(args, transform=None, sequentially_merge_test=False,
@@ -418,6 +415,7 @@ def get_model_and_loader():
                kwargs=vars(args))
 
     # build the Variational Saccading module
+    # and lazy generate the non-constructed modules
     saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
     lazy_generate_modules(saccader, loader.train_loader)
 
@@ -436,9 +434,7 @@ def get_model_and_loader():
     if args.cuda:
         saccader = saccader.cuda()
 
-    # if args.ngpu > 1:
-    #     saccader = set_multigpu(saccader)
-    if args.ngpu > 1:
+    if args.ngpu > 1: # parallelize across GPU
         saccader.parallel()
 
     # build the grapher object
@@ -456,45 +452,28 @@ def lazy_generate_modules(model, loader):
     for item in loader:
         # first destructure the data and cuda-ize and wrap in vars
         x_original, x_related, _ = _unpack_data_and_labels(item)
-        #x_related = cudaize(x_related, is_data_tensor=True)
         x_original, x_related = generate_related(x_related, x_original, args)
-        #x_original = cudaize(x_original, is_data_tensor=True)
         _ = model(x_original, x_related)
         break
 
     #model = init_weights(model)
 
-# def lbda_fn(z):
-#     chans = args.img_shp[0]
-#     return torch.from_numpy(np.random.rand(1, chans,
-#                                            args.window_size,
-#                                            args.window_size).astype(np.float32))
 
-# def lazy_generate_modules(model):
-#     ''' Super hax, but needed for building lazy modules '''
-#     model.eval()
-#     chans = args.img_shp[0]
-#     x_related = Variable(same_type(args.half, args.cuda)(args.batch_size, *args.img_shp).normal_())
-#     if args.synthetic_upsample_size > 0: # handle the synthetic case
-#         x_original = Variable(same_type(args.half, args.cuda)(args.batch_size, chans,
-#                                                               args.synthetic_upsample_size,
-#                                                               args.synthetic_upsample_size).normal_())
-#     else: # handle the case with true lambdas
-#         # don't use actual lambdas here because of multiprocessing
-#         x_original = [lbda_fn for _ in range(args.batch_size)]
+def generate(epoch, model, grapher, generate_every=10):
+    ''' generate some synthetic '''
+    if epoch % generate_every == 0:
+        samples = model.generate(args.batch_size)
+        register_images([samples], ["samples"],
+                        grapher, prefix="generated")
+        grapher.show()
 
-#     model(x_original, x_related)
-#     # model = init_weights(model)
+        # cleanups
+        del samples
 
 
 def run(args):
     # collect our model and data loader
     model, loader, grapher = get_model_and_loader()
-
-    # since some modules are lazy generated
-    # we want to run a single fwd pass
-    # lazy_generate_modules(model, loader.train_loader)
-    # lazy_generate_modules(model)
 
     # collect our optimizer
     optimizer = build_optimizer(model)
@@ -508,6 +487,7 @@ def run(args):
         for epoch in range(1, args.epochs + 1):
             train(epoch, model, optimizer, loader.train_loader, grapher)
             test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
+            generate(epoch, model, grapher)
             if args.early_stop and early(test_loss):
                 early.restore() # restore and test+generate again
                 test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
