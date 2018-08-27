@@ -378,7 +378,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
     # delete the data instances, see https://tinyurl.com/ycjre67m
     images.clear(), img_names.clear()
     output_map.clear(), reparam_scalars.clear()
-    del x_related, x_original, labels
+    del x_related; del x_original; del labels
 
     # return this for early stopping
     loss_val = loss_map['loss_mean'].detach().item()
@@ -453,8 +453,10 @@ def lazy_generate_modules(model, loader):
         # first destructure the data and cuda-ize and wrap in vars
         x_original, x_related, _ = _unpack_data_and_labels(item)
         x_original, x_related = generate_related(x_related, x_original, args)
-        _ = model(x_original, x_related)
-        break
+        with torch.no_grad():
+            _ = model(x_original, x_related)
+            del x_original; del x_related
+            break
 
     #model = init_weights(model)
 
@@ -462,9 +464,16 @@ def lazy_generate_modules(model, loader):
 def generate(epoch, model, grapher, generate_every=10):
     ''' generate some synthetic '''
     if epoch % generate_every == 0:
+        start_time = time.time()
         samples = model.generate(args.batch_size)
-        register_images([samples], ["samples"],
-                        grapher, prefix="generated")
+        num_samples = len(samples) * np.prod(list(samples[0].shape))
+        print("generated[Epoch {}][{} samples][{} sec]".format(
+            epoch,
+            num_samples,
+            time.time() - start_time)
+        )
+        img_names = ['samples_{}'.format(i) for i in range(len(samples))]
+        register_images(samples, img_names, grapher, prefix="generated")
         grapher.show()
 
         # cleanups
@@ -485,9 +494,10 @@ def run(args):
 
         test_loss, test_acc = 0.0, 0.0
         for epoch in range(1, args.epochs + 1):
+            generate(epoch, model, grapher)
             train(epoch, model, optimizer, loader.train_loader, grapher)
             test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
-            generate(epoch, model, grapher)
+
             if args.early_stop and early(test_loss):
                 early.restore() # restore and test+generate again
                 test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
