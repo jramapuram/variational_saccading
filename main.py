@@ -1,4 +1,7 @@
+import os
+import gc
 import time
+import psutil
 import argparse
 import numpy as np
 import pprint
@@ -9,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 from torch.autograd import Variable
+
 
 from models.vae.vrnn import VRNN
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
@@ -58,6 +62,8 @@ parser.add_argument('--downsample-scale', type=int, default=7,
 # Model parameters
 parser.add_argument('--activation', type=str, default='identity',
                     help='default activation function (default: identity)')
+parser.add_argument('--latent-size', type=int, default=512, metavar='N',
+                    help='sizing for latent layers (default: 256)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='beta',
@@ -80,6 +86,8 @@ parser.add_argument('--restore', type=str, default=None,
                     help='path to a model to restore (default: None)')
 
 # RNN related
+parser.add_argument('--use-prior-kl', action='store_true',
+                    help='add a kl on the VRNN prior against the true prior (default: False)')
 parser.add_argument('--use-noisy-rnn-state', action='store_true',
                     help='uses a noisy initial rnn state instead of zeros (default: False)')
 parser.add_argument('--max-time-steps', type=int, default=4,
@@ -117,11 +125,11 @@ parser.add_argument('--optimizer', type=str, default="adam",
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping for RNN (default: 0.25)')
 
-# Visdom parameters
-parser.add_argument('--visdom-url', type=str, default="http://localhost",
-                    help='visdom URL for graphs (default: http://localhost)')
-parser.add_argument('--visdom-port', type=int, default="8097",
-                    help='visdom port for graphs (default: 8097)')
+# Visdom / tensorboard parameters
+parser.add_argument('--visdom-url', type=str, default=None,
+                    help='visdom URL for graphs (needs http, eg: http://localhost) (default: None)')
+parser.add_argument('--visdom-port', type=int, default=None,
+                    help='visdom port for graphs (default: None)')
 
 # Device parameters
 parser.add_argument('--seed', type=int, default=None,
@@ -189,10 +197,9 @@ def register_images(images, names, grapher, prefix="train"):
         for im, name in zip(images, names):
             register_images(im, name, grapher, prefix=prefix)
     else:
-        images = torch.min(images.detach(), ones_like(images))
-        grapher.register_single({'{}_{}'.format(prefix, names): images},
-                                plot_type='imgs')
-
+        #images = torch.min(images.detach(), ones_like(images))
+        grapher.add_image('{}_{}'.format(prefix, names),
+                          images.detach(), 0)
 
 def register_plots(loss, grapher, epoch, prefix='train'):
     ''' helper to register all plots with *_mean and *_scalar '''
@@ -203,8 +210,7 @@ def register_plots(loss, grapher, epoch, prefix='train'):
         if 'mean' in k or 'scalar' in k:
             key_name = k.split('_')[0]
             value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
-            grapher.register_single({'%s_%s' % (prefix, key_name): [[epoch], [value]]},
-                                    plot_type='line')
+            grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
 def _add_loss_map(loss_tm1, loss_t):
@@ -215,7 +221,7 @@ def _add_loss_map(loss_tm1, loss_t):
         for k, v in loss_t.items():
             if 'mean' in k or 'scalar' in k:
                 if not isinstance(v, (float, np.float32, np.float64)):
-                    resultant[k] = v.detach()
+                    resultant[k] = v.clone().detach()
                 else:
                     resultant[k] = v
 
@@ -225,7 +231,7 @@ def _add_loss_map(loss_tm1, loss_t):
     for (k, v) in loss_t.items():
         if 'mean' in k or 'scalar' in k:
             if not isinstance(v, (float, np.float32, np.float64)):
-                resultant[k] = loss_tm1[k] + v.detach()
+                resultant[k] = loss_tm1[k] + v.clone().detach()
             else:
                 resultant[k] = loss_tm1[k] + v
 
@@ -247,16 +253,17 @@ def generate_related(data, x_original, args):
     if x_original is not None:
         return x_original, data
 
-    # first upsample the image and then downsample the upsampled version
+    # first downsample the image and then upsample it
     # this creates a 'blurry' related image making the problem tougher
     original_img_size = tuple(data.size()[-2:])
-    ds_img_size = tuple(int(i) for i in np.asarray([32, 32]) // args.downsample_scale)  # eg: [12, 12]
-    downsampled = F.upsample(
-        F.upsample(data, ds_img_size, mode='bilinear'),
-        (32, 32), mode='bilinear')
-    data = F.upsample(data, (args.synthetic_upsample_size,
-                             args.synthetic_upsample_size), mode='bilinear')
-    return data, downsampled
+    ds_img_size = tuple(int(i) for i in np.asarray(original_img_size)
+                        // args.downsample_scale)  # eg: [12, 12]
+    x_downsampled = F.upsample(
+        F.upsample(data, ds_img_size, mode='bilinear'), # blur the crap out
+        original_img_size, mode='bilinear')             # of the original data
+    x_upsampled = F.upsample(data, (args.synthetic_upsample_size,
+                                    args.synthetic_upsample_size), mode='bilinear')
+    return x_upsampled, x_downsampled
 
 
 def _unpack_data_and_labels(item):
@@ -288,7 +295,8 @@ def cudaize(tensor, is_data_tensor=False):
     return tensor
 
 
-def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='test'):
+def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
+                  prefix='test', plot_mem=False):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
     start_time = time.time()
     model.eval() if not 'train' in prefix else model.train()
@@ -336,6 +344,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
                 #                                 args.clip)
 
             optimizer.step()
+            del loss_t
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean']
@@ -349,6 +358,12 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
 
     # gather scalar values of reparameterizers (if they exist)
     reparam_scalars = model.vae.get_reparameterizer_scalars()
+
+    # add memory tracking
+    if plot_mem:
+        process = psutil.Process(os.getpid())
+        loss_map['cpumem_scalar'] = process.memory_info().rss * 1e-6
+        loss_map['cudamem_scalar'] = torch.cuda.memory_allocated() * 1e-6
 
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
@@ -375,27 +390,33 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None, prefix='te
     register_images(images, img_names, grapher, prefix=prefix)
     grapher.show()
 
-    # delete the data instances, see https://tinyurl.com/ycjre67m
-    images.clear(), img_names.clear()
-    output_map.clear(), reparam_scalars.clear()
-    del x_related; del x_original; del labels
-
     # return this for early stopping
-    loss_val = loss_map['loss_mean'].detach().item()
-    loss_map.clear()
+    loss_val = loss_map['loss_mean'].clone().detach().item()
+
+    # delete the data instances, see https://tinyurl.com/ycjre67m
+    images.clear(), img_names.clear(), loss_map.clear()
+    output_map.clear(), reparam_scalars.clear()
+    del images; del img_names; del loss_map
+    del output_map; del reparam_scalars
+    del x_related; del x_original; del labels
+    gc.collect()
+
+    # return loss and accuracy
     return loss_val, correct_percent
 
 
 def train(epoch, model, optimizer, loader, grapher, prefix='train'):
     ''' train loop helper '''
     return execute_graph(epoch, model, loader,
-                         grapher, optimizer, 'train')
+                         grapher, optimizer, 'train',
+                         plot_mem=True)
 
 
 def test(epoch, model, loader, grapher, prefix='test'):
      ''' test loop helper '''
      return execute_graph(epoch, model, loader,
-                          grapher, prefix='test')
+                          grapher, prefix='test',
+                          plot_mem=False)
 
 
 def get_model_and_loader():
@@ -407,11 +428,9 @@ def get_model_and_loader():
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
-    vae = VRNN([loader.img_shp[0], 32, 32], #loader.img_shp,
-               latent_size=512,            # XXX: hard coded
-               normalization="batchnorm",  # XXX: hard coded
-               n_layers=2,                 # XXX: hard coded
-               bidirectional=True,         # XXX: hard coded
+    vae = VRNN(loader.img_shp,
+               n_layers=2,            # XXX: hard coded
+               bidirectional=True,    # XXX: hard coded
                kwargs=vars(args))
 
     # build the Variational Saccading module
@@ -437,10 +456,17 @@ def get_model_and_loader():
     if args.ngpu > 1: # parallelize across GPU
         saccader.parallel()
 
-    # build the grapher object
-    grapher = Grapher(env=saccader.get_name(),
-                      server=args.visdom_url,
-                      port=args.visdom_port)
+    # build the grapher object (tensorboard or visdom)
+    # and plot config json to visdom
+    if args.visdom_url is not None:
+        grapher = Grapher('visdom',
+                          env=saccader.get_name(),
+                          server=args.visdom_url,
+                          port=args.visdom_port)
+    else:
+        grapher = Grapher('tensorboard', comment=saccader.get_name())
+
+    grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(saccader.config), 0)
 
     # register_nan_checks(saccader)
     return [saccader, loader, grapher]
@@ -456,6 +482,7 @@ def lazy_generate_modules(model, loader):
         with torch.no_grad():
             _ = model(x_original, x_related)
             del x_original; del x_related
+            gc.collect()
             break
 
     #model = init_weights(model)
@@ -465,9 +492,10 @@ def generate(epoch, model, grapher, generate_every=10):
     ''' generate some synthetic '''
     if epoch % generate_every == 0:
         start_time = time.time()
-        samples = model.generate(args.batch_size)
+        samples = F.upsample(model.generate(args.batch_size), (32, 32),
+                             mode='bilinear')
         num_samples = len(samples) * np.prod(list(samples[0].shape))
-        print("generated[Epoch {}][{} samples][{} sec]".format(
+        print("generate[Epoch {}][{} samples][{} sec]".format(
             epoch,
             num_samples,
             time.time() - start_time)
@@ -477,7 +505,8 @@ def generate(epoch, model, grapher, generate_every=10):
         grapher.show()
 
         # cleanups
-        del samples
+        del samples; del img_names
+        gc.collect()
 
 
 def run(args):
@@ -507,10 +536,8 @@ def run(args):
             if args.optimizer == 'sgd_momentum':
                 adjust_learning_rate(optimizer, args.lr, epoch)
 
-        # plot config json to visdom
-        grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.config),
-                         opts=dict(title="config"))
-        grapher.save() # save to json after distributional interval
+
+        grapher.save() # save to endpoint after training
     else:
         assert model.load(args.restore), "Failed to load model"
         test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
@@ -522,3 +549,22 @@ def run(args):
 
 if __name__ == "__main__":
     run(args)
+
+# When placed on run(args):
+#                          types |   # objects |   total size
+# ============================== | =========== | ============
+#                   <class 'list |       11073 |      1.05 MB
+#                    <class 'str |       13772 |      1.04 MB
+#                    <class 'int |        2571 |     70.63 KB
+#                   <class 'dict |         167 |     68.61 KB
+#                   <class 'code |         337 |     47.51 KB
+#                   <class 'type |          29 |     39.01 KB
+#                  <class 'tuple |         183 |     11.77 KB
+#                    <class 'set |          26 |      9.19 KB
+#   <class 'PIL.TiffTags.TagInfo |         103 |      8.85 KB
+#                <class 'weakref |         101 |      7.89 KB
+#            <class 'abc.ABCMeta |           4 |      4.72 KB
+#            function (delegate) |          28 |      3.72 KB
+#                   <class 'cell |          60 |      2.81 KB
+#      <class 'getset_descriptor |          37 |      2.60 KB
+#            function (<lambda>) |          19 |      2.52 KB

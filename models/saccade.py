@@ -4,6 +4,8 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
+
+from copy import deepcopy
 from torch.autograd import Variable
 
 from helpers.utils import expand_dims, check_or_create_dir, \
@@ -70,10 +72,10 @@ def z_where_inv(z_where, clip_scale=5.0):
         print("tensor scale of {} dim was 0!!".format(scale.shape))
         exit(-1)
 
-    # nan_check_and_break(scale, "scale")
+    nan_check_and_break(scale, "scale")
     out = out / scale
-
     # out = out / z_where[:, 0:1]
+
     return out
 
 def window_to_image(z_where, window_size, image_size, windows):
@@ -121,10 +123,9 @@ def image_to_window_discrete(z_where, window_size, image_size, images, scale=Non
 
 
 class Saccader(nn.Module):
-    def __init__(self, vae, output_size, latent_size=512, **kwargs):
+    def __init__(self, vae, output_size, **kwargs):
         super(Saccader, self).__init__()
         self.vae = vae
-        self.latent_size = latent_size
         self.output_size = output_size
         self.config = kwargs['kwargs']
 
@@ -132,9 +133,12 @@ class Saccader(nn.Module):
         self.pool = CropLambdaPool(self.config['batch_size'])
 
         # build the projection to softmax from RNN state
-        self.latent_projector = ImageStateProjector(latent_size=self.latent_size,
-                                                    output_size=self.output_size,
-                                                    config=self.config)
+        # self.latent_projector = ImageStateProjector(output_size=self.output_size,
+        #                                             config=self.config)
+        config_copy = deepcopy(self.config)
+        config_copy['latent_size'] = self.output_size
+        self.latent_projector = ImageStateProjector(output_size=self.output_size,
+                                                    config=config_copy)
 
     def parallel(self):
         self.latent_projector.parallel()
@@ -190,7 +194,7 @@ class Saccader(nn.Module):
             target=labels,
             reduce=False
         )
-        # nan_check_and_break(pred_loss, "pred_loss")
+        nan_check_and_break(pred_loss, "pred_loss")
 
         # TODO: try multi-task loss
         vae_loss_map['loss'] = vae_loss_map['loss'] * pred_loss
@@ -203,11 +207,6 @@ class Saccader(nn.Module):
     def _z_to_image_transformer(self, z, imgs):
         return image_to_window(z[:, 0:3], self.config['window_size'],
                                imgs, max_image_percentage=self.config['max_image_percentage'])
-
-    def _z_to_image_bounding_box(self, z, imgs):
-        img_size = list(imgs.size())[1:]
-        return image_to_window_continuous(z[:, 0:3], self.config['window_size'] // 2,
-                                          images=imgs, cuda=self.config['cuda'])
 
     def _z_to_image_lambda(self, z, imgs):
         crops = torch.cat(self.pool(imgs, z.clone().detach().cpu().numpy()), 0)
@@ -251,16 +250,11 @@ class Saccader(nn.Module):
             # reset the state, output and the truncate window
             self.vae.memory.init_state(batch_size, cuda=x_related.is_cuda)
             self.vae.memory.init_output(batch_size, seqlen=1, cuda=x_related.is_cuda)
-            x_trunc_t = zeros((batch_size, chans,
-                               self.config['window_size'],
-                               self.config['window_size']),
-                              cuda=x_related.is_cuda,
-                              dtype=get_dtype(x_related))
 
             # accumulator for predictions
-            x_preds = zeros((batch_size, self.latent_size),
+            x_preds = zeros((batch_size, self.output_size), #self.config['latent_size']),
                             cuda=x_related.is_cuda,
-                            dtype=get_dtype(x_related))
+                            dtype=get_dtype(x_related)).requires_grad_()
 
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
@@ -277,7 +271,7 @@ class Saccader(nn.Module):
 
                 # do preds and sum
                 state = torch.mean(self.vae.memory.get_state()[0], 0)
-                x_preds += self.latent_projector(x_trunc_t, state)
+                x_preds = x_preds + self.latent_projector(x_trunc_t, state)
 
                 # decode the posterior
                 decoded_t = self.vae.decode(z_t, produce_output=True)
@@ -288,7 +282,8 @@ class Saccader(nn.Module):
                 crops.append(x_trunc_t)
                 decodes.append(decoded_t)
 
-            preds = self.latent_projector.get_output(x_preds / self.config['max_time_steps'])
+            #preds = self.latent_projector.get_output(x_preds / self.config['max_time_steps'])
+            preds = x_preds / self.config['max_time_steps']
             return {
                 'decoded': decodes,
                 'params': params,

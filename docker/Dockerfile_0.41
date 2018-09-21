@@ -55,5 +55,8 @@ RUN rm -rf /opt/pytorch && rm -rf /opt/apex
 ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/usr/local/lib
 RUN /opt/conda/bin/pip uninstall -y pyvips && /opt/conda/bin/pip install --no-cache-dir pyvips
 
+# install pyro-ppl, tensorboard and tensorflow-gpu (for tensorboard)
+RUN /opt/conda/bin/pip install pyro-ppl tensorboardX tensorflow-gpu
+
 WORKDIR /workspace
 RUN chmod -R a+w /workspace
