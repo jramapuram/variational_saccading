@@ -4,3 +4,6 @@
 [submodule "datasets"]
 	path = datasets
 	url = git+ssh://git@github.com/jramapuram/datasets
+[submodule "models/vae"]
+	path = models/vae
+	url = git+ssh://git@github.com/jramapuram/vae.git

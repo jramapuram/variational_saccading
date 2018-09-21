@@ -1,0 +1,62 @@
+FROM nvidia/cuda:9.2-cudnn7-devel-ubuntu16.04
+ARG PYTHON_VERSION=3.6
+RUN apt-get update && apt-get install -y --no-install-recommends \
+         build-essential \
+         cmake \
+	 htop \
+         git \
+         curl \
+	 imagemagick \
+         emacs-nox \
+         ca-certificates \
+	 libcfitsio-dev	\
+	 libopenslide-dev \
+         libjpeg-dev \
+	 pkg-config \
+	 glib2.0-dev \
+	 librsvg2-dev \
+	 libexpat1-dev \
+	 libtiff5-dev \
+	 libjpeg-turbo8-dev \
+	 libgsf-1-dev \
+         libpng-dev &&\
+     rm -rf /var/lib/apt/lists/*
+
+
+RUN curl -L -O https://repo.anaconda.com/archive/Anaconda3-5.2.0-Linux-x86_64.sh && \
+    sh ./Anaconda3-5.2.0-Linux-x86_64.sh -b -p /opt/conda && \
+    rm ./Anaconda3-5.2.0-Linux-x86_64.sh
+
+# install conda
+RUN /opt/conda/bin/conda install pytorch torchvision cuda92 -c pytorch
+RUN /opt/conda/bin/conda install -y -c conda-forge opencv
+
+# install libvips
+RUN cd /tmp && curl -L -O https://github.com/jcupitt/libvips/releases/download/v8.7.0-rc2/vips-8.7.0-rc2.tar.gz
+RUN cd /tmp && tar xvf vips-8.7.0-rc2.tar.gz && cd vips-8.7.0 && ./configure && make -j8 && make install
+
+ENV PATH /opt/conda/bin:$PATH
+# This must be done before pip so that requirements.txt is available
+WORKDIR /opt/pytorch
+
+# install misc deps
+RUN /opt/conda/bin/pip install torchvision tqdm pyvips msgpack joblib
+RUN /opt/conda/bin/pip install visdom==0.1.8.4
+RUN /opt/conda/bin/conda install -c defaults libprotobuf protobuf
+
+# install apex
+RUN git clone --recursive https://github.com/NVIDIA/apex /opt/apex
+RUN cd /opt/apex && /opt/conda/bin/python setup.py install
+
+#cleanup
+RUN rm -rf /opt/pytorch && rm -rf /opt/apex
+
+# fixup apex
+ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/usr/local/lib
+RUN /opt/conda/bin/pip uninstall -y pyvips && /opt/conda/bin/pip install --no-cache-dir pyvips
+
+# install pyro-ppl, tensorboard and tensorflow-gpu (for tensorboard)
+RUN /opt/conda/bin/pip install pyro-ppl tensorboardX tensorflow-gpu
+
+WORKDIR /workspace
+RUN chmod -R a+w /workspace
