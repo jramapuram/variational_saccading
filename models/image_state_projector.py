@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 
-from helpers.layers import get_encoder, str_to_activ
+from helpers.layers import get_encoder, str_to_activ, str_to_activ_module
 
 
 class ImageStateProjector(nn.Module):
@@ -18,8 +18,13 @@ class ImageStateProjector(nn.Module):
         # combined = str_to_activ(self.config['activation'])(
         #     torch.cat([state, conv_features], -1)
         # )
-        # return self.state_proj(combined)
-        return conv_features
+        combined = torch.cat([state, conv_features], -1)
+        return self.state_proj(combined)
+
+    def fp16(self):
+        self.conv = self.conv.half()
+        self.state_proj = self.state_proj.half()
+        self.out_proj = self.out_proj.half()
 
     def parallel(self):
         self.conv = nn.DataParallel(self.conv)
@@ -43,20 +48,24 @@ class ImageStateProjector(nn.Module):
 
         # main function approximator to extract crop features
         conv = get_encoder(self.config, name='crop_feat')(
-            crop_size, self.config['latent_size']
+            crop_size, self.config['latent_size'],
+            activation_fn=str_to_activ_module(self.config['activation'])
         )
 
         # takes the state + output of conv and projects it
         state_projector = nn.Sequential(
             self._get_dense(name='state_proj')(
-                self.config['latent_size']*2, self.config['latent_size']
+                self.config['latent_size']*2, self.config['latent_size']+1,
+                normalization_str=self.config['dense_normalization'],
+                activation_fn=str_to_activ_module(self.config['activation'])
             )
         )
 
         # takes the finally aggregated vector and projects to output dims
         output_projector = self._get_dense(name='output_proj')(
             self.config['latent_size'], self.output_size,
-            normalization_str=self.config['dense_normalization']
+            normalization_str=self.config['dense_normalization'],
+            activation_fn=str_to_activ_module(self.config['activation'])
         )
 
         return conv, state_projector, output_projector
