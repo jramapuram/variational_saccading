@@ -22,6 +22,7 @@ args = parser.parse_args()
 
 def get_rand_hyperparameters():
     return {
+        'seed': 1234,
         'max-time-steps': np.random.choice([2, 3, 4]),
         'synthetic-upsample-size': 0,
         'downsample-scale': 1,
@@ -31,18 +32,19 @@ def get_rand_hyperparameters():
         'data-dir': os.path.join(expanduser("~"), 'datasets/cluttered_imagefolder_ptiff_v3'),
         'visdom-url': 'http://neuralnetworkart.com', # FIXED
         'visdom-port': 8097,                         # FIXED
-        'differentiable-image-size': np.random.choice([300, 200, 100, 500, 1000]),
-        'clip': np.random.choice([0, 0.25, 0.5, 0.75, 1.0, 5.0]),
+        'lr': np.random.choice([1e-3, 1e-4, 2e-4, 1e-5]),
+        'crop-padding': np.random.choice([2, 3, 4, 5, 6, 7, 8]),
+        'clip': np.random.choice([0, 0, 0.25, 0.5, 0.75, 1.0, 5.0]),
         'latent-size': np.random.choice([64, 128, 256, 512]),
-        'max-image-percentage': np.random.choice([0.1, 0.15, 0.2, 0.3]),
+        'max-image-percentage': np.random.choice([0.2, 0.3]),
         'dense-normalization': np.random.choice(['batchnorm', 'none']),
         'conv-normalization': np.random.choice(['groupnorm', 'batchnorm', 'none']),
-        'batch-size': np.random.choice([32, 48, 64, 76]),
+        'batch-size': np.random.choice([32, 64, 128, 160, 256, 300]),
         'reparam-type': np.random.choice(['beta', 'mixture', 'isotropic_gaussian']),
         'encoder-layer-type': np.random.choice(['conv', 'dense']),
         'decoder-layer-type': np.random.choice(['conv', 'dense']),
         'discrete-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
-        'continuous-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
+        'continuous-size': np.random.choice([6, 10, 40, 64, 128, 160]),
         'optimizer': np.random.choice(['adam', 'rmsprop', 'sgd_momentum']),
         'use-noisy-rnn-state': np.random.choice([1, 0]),
         'use-prior-kl': np.random.choice([1, 0]),
@@ -64,7 +66,7 @@ def format_job_str(job_map, run_str):
 
 #SBATCH --job-name={}
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=10
 #SBATCH --partition={}
 #SBATCH --time={}
 #SBATCH --gres=gpu:1
@@ -72,7 +74,7 @@ def format_job_str(job_map, run_str):
 #SBATCH --constraint="COMPUTE_CAPABILITY_6_0|COMPUTE_CAPABILITY_6_1"
 echo $CUDA_VISIBLE_DEVICES
 {}
-srun {}""".format(
+srun --unbuffered {}""".format(
     job_map['job-name'],
     job_map['partition'],
     job_map['time'],
@@ -112,13 +114,13 @@ def format_task_str(hp):
     return """{} ../main.py --early-stop {} --uid={}""".format(
         python_bin,
         hpmap_str,
-        "{}".format(hp['task']) + "_hp_search{}_"
+        "{}".format('numgrad_' + hp['task']) + "_hp_search{}_"
     ).replace("\n", " ").replace("\r", "").replace("   ", " ").replace("  ", " ").strip()
 
 def get_job_map(idx, gpu_type):
     return {
-        'partition': 'kruse-gpu,kalousis-gpu',
-        'time': '48:00:00',
+        'partition': 'shared-gpu',
+        'time': '12:00:00',
         'gpu': gpu_type,
         'job-name': "hp_search{}".format(idx)
     }

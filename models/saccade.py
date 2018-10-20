@@ -12,7 +12,7 @@ from helpers.utils import expand_dims, check_or_create_dir, \
     plot_tensor_grid
 from helpers.layers import View
 from .image_state_projector import ImageStateProjector
-from .inlay_to_cropv6 import InlayToCropProjector
+from .numerical_diff_module import NumericalDifferentiator
 from .spatial_transformer import SpatialTransformer
 from datasets.crop_dual_imagefolder import CropLambdaPool, USE_LIB
 
@@ -41,23 +41,20 @@ class Saccader(nn.Module):
                                                     config=self.config)
 
         # build the inlay projector
-        self.inlay_projector = InlayToCropProjector(
-            # self.vae.reparameterizer.output_size,
-            # self.config
-        )
+        self.numgrad = NumericalDifferentiator(self.config)
 
         # build the spatial transformer
         self.spatial_transformer = SpatialTransformer(self.config)
 
     def fp16(self):
         self.latent_projector.fp16()
-        self.inlay_projector.fp16()
+        self.numgrad.fp16()
         self.vae.fp16()
         self.spatial_transformer = self.spatial_transformer.half()
 
     def parallel(self):
         self.latent_projector.parallel()
-        self.inlay_projector.parallel()
+        self.numgrad.parallel()
         self.vae.parallel()
         self.spatial_transformer = nn.DataParallel(self.spatial_transformer)
 
@@ -155,7 +152,7 @@ class Saccader(nn.Module):
         nan_check_and_break(pred_loss, "pred_loss")
 
         # the crop prediction loss [ only for lambda images ]
-        # crop_loss = self.inlay_projector.loss_function(
+        # crop_loss = self.numgrad.loss_function(
         #     output_map['crops'],
         #     output_map['crops_true']
         # ) if len(output_map['crops_true']) > 0 else torch.zeros_like(pred_loss)
@@ -192,16 +189,20 @@ class Saccader(nn.Module):
     def _clamp_sample(self, z):
         ''' clamps to [0, 1] '''
         clamp_map = {
-            'beta': lambda z: z,                         # no change
-            'isotropic_gaussian': lambda z: (z + 3) / 6  # re-normalize to [0, 1]
+            'beta': lambda z: z,                          # no change
+            'isotropic_gaussian': lambda z: (z + 3) / 6,  # re-normalize to [0, 1]
+            'mixture': lambda z: (                        # re-normalize to [0, 1]
+                z[:, 0:self.vae.reparameterizer.num_continuous_input] + 3) / 6
         }
         return torch.clamp(clamp_map[self.config['reparam_type']](z), 0.0, 1.0)
 
     def _invert_clamp_sample(self, z):
         ''' inverts clamp to [-3, 3] '''
         clamp_map = {
-            'beta': lambda z: (z * 6) - 3,              # re-normalize to [-3, 3]
-            'isotropic_gaussian': lambda z: (z * 6) - 3 # re-normalize to [-3, 3]
+            'beta': lambda z: (z * 6) - 3,               # re-normalize to [-3, 3]
+            'isotropic_gaussian': lambda z: (z * 6) - 3, # re-normalize to [-3, 3]
+            'mixture': lambda z: (                       # re-normalize to [-3, 3]
+                z[:, 0:self.vae.reparameterizer.num_continuous_input] * 6) - 3
         }
         return clamp_map[self.config['reparam_type']](z)
 
@@ -210,7 +211,7 @@ class Saccader(nn.Module):
         ''' run the z's through the threadpool, returning inlays and true crops'''
         clamped_z = self._clamp_sample(z[:, 0:3])  # clamp to [0, 1] range
         crops = self._pool_to_imgs(clamped_z, imgs)
-        predicted_crops = self.inlay_projector(crops)
+        predicted_crops = self.numgrad(z, crops)
 
         nan_check_and_break(predicted_crops, "predicted_crops_t")
 
@@ -231,52 +232,6 @@ class Saccader(nn.Module):
         is_cuda = z.is_cuda if isinstance(z, torch.Tensor) else False
         return crops.cuda() if is_cuda else crops
 
-    # def _pool_to_imgs(self, z, imgs, override=False):
-    #     # tabulate the crops using the threadpool and re-stitch together
-    #     z_np = z.clone().detach().cpu().numpy() if not isinstance(z, np.ndarray) else z
-    #     pool_tabulated = self.pool(imgs, z_np, override=override)
-    #     assert isinstance(pool_tabulated, (list, np.ndarray))
-
-    #     # remove crops and inlays appropriately
-    #     crops = torch.cat([pt[0] for pt in pool_tabulated], 0)
-    #     inlay = torch.cat([pt[1] for pt in pool_tabulated], 0)
-    #     numerical_grads = torch.cat([pt[2] for pt in pool_tabulated], 0)
-
-    #     # push to cuda if necessary
-    #     is_cuda = z.is_cuda if isinstance(z, torch.Tensor) else False
-    #     crops = crops.cuda() if is_cuda else crops
-    #     inlay = inlay.cuda() if is_cuda else inlay
-    #     numerical_grads = numerical_grads.cuda() if is_cuda else numerical_grads
-    #     del pool_tabulated # memory cleanups
-
-    #     return crops, inlay, numerical_grads
-
-    # def _z_to_image_lambda(self, z, imgs):
-    #     ''' run the z's through the threadpool, returning inlays and true crops'''
-    #     clamped_z = self._clamp_sample(z[:, 0:3])  # clamp to [0, 1] range
-    #     crops, inlay, numerical_grads = self._pool_to_imgs(clamped_z, imgs)
-
-    #     # for img_i, lbda in zip(windows_in_imgs, imgs):
-    #     #     plt.imshow(img_i.transpose(2, 0).squeeze(), cmap='gray')
-    #     #     filename = lbda.path.split('/')[-2] + '_' + lbda.path.split('/')[-1].split('.')[0]
-    #     #     plt.savefig('imgs/' + filename + '_inversewindow.png', bbox_inches='tight')
-    #     #     plt.close()
-
-    #     # predict the crops using the current z
-    #     #predicted_crops = self.inlay_projector(inlay, self._invert_clamp_sample(clamped_z))
-    #     #predicted_crops = self.inlay_projector(inlay, z)
-    #     predicted_crops = self.inlay_projector(clamped_z, crops, numerical_grads)
-
-    #     nan_check_and_break(crops, "true_crops_t")
-    #     nan_check_and_break(predicted_crops, "predicted_crops_t")
-    #     nan_check_and_break(inlay, "inlay_t")
-
-    #     return {
-    #         'inlay': inlay,
-    #         'crops_true': crops,
-    #         'crops_pred': predicted_crops
-    #     }
-
     def _z_to_image(self, z, imgs):
         ''' accepts images (or lambdas to crop) and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
@@ -290,16 +245,7 @@ class Saccader(nn.Module):
             'lambda': self._z_to_image_lambda
         }
         crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
-        true_crops = crop_fn_map[crop_type](z, imgs)
-
-        # for crp, img_i in zip(true_crops, imgs):
-        #     print('crops = ', crp.shape)
-        #     plt.imshow(crp.transpose(2, 0).squeeze(), cmap='gray')
-        #     filename = img_i.path.split('/')[-2] + '_' + img_i.path.split('/')[-1].split('.')[0]
-        #     plt.savefig('imgs/' + filename + '_transformer.png', bbox_inches='tight')
-        #     plt.close()
-
-        return true_crops
+        return crop_fn_map[crop_type](z, imgs)
 
     def generate(self, batch_size):
         self.eval()

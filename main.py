@@ -23,7 +23,7 @@ from models.saccade import Saccader
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
 from optimizers.adamnormgrad import AdamNormGrad
 from optimizers.adamw import AdamW
-from optimizers.utils import adjust_learning_rate
+from optimizers.utils import decay_lr_every
 from helpers.grapher import Grapher
 from helpers.metrics import softmax_accuracy
 from helpers.utils import same_type, ones_like, \
@@ -56,10 +56,8 @@ parser.add_argument('--max-image-percentage', type=float, default=0.15,
                     help='maximum percentage of the image to look over (default: 0.15)')
 parser.add_argument('--window-size', type=int, default=32,
                     help='window size for saccades [becomes WxW] (default: 32)')
-parser.add_argument('--crop-padding', type=int, default=1,
-                    help='the extra padding around the crop for numerical diff (default: 1)')
-parser.add_argument('--differentiable-image-size', type=int, default=128,
-                    help='differentiable image size for placing above window (default: 128)')
+parser.add_argument('--crop-padding', type=int, default=6,
+                    help='the extra padding around the crop for numerical diff (default: 6)')
 parser.add_argument('--downsample-scale', type=int, default=7,
                     help='downscale the image by this scalar, eg: [100 // 8 , 100 // 8] (default: 8)')
 
@@ -98,18 +96,18 @@ parser.add_argument('--max-time-steps', type=int, default=4,
                     help='max time steps for RNN (default: 4)')
 
 # Regularizer related
-parser.add_argument('--continuous-mut-info', type=float, default=0.0,
+parser.add_argument('--continuous-mut-info', type=float, default=0,
                     help='-continuous_mut_info * I(z_c; x) is applied (opposite dir of disc)(default: 0.0)')
-parser.add_argument('--discrete-mut-info', type=float, default=0.0,
+parser.add_argument('--discrete-mut-info', type=float, default=0,
                     help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
-parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
-                    help='clamp mut info by norm / clamp / none (default: clamp)')
+parser.add_argument('--mut-clamp-strategy', type=str, default="none",
+                    help='clamp mut info by norm / clamp / none (default: none)')
 parser.add_argument('--mut-clamp-value', type=float, default=100.0,
                     help='max / min clamp value if above strategy is clamp (default: 100.0)')
 parser.add_argument('--monte-carlo-infogain', action='store_true',
                     help='use the MC version of mutual information gain / false is analytic (default: False)')
-parser.add_argument('--mut-reg', type=float, default=0.3,
-                    help='mutual information regularizer [mixture only] (default: 0.3)')
+parser.add_argument('--mut-reg', type=float, default=0,
+                    help='mutual information regularizer [mixture only] (default: 0)')
 parser.add_argument('--kl-reg', type=float, default=1.0,
                     help='hyperparameter to scale KL term in ELBO')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
@@ -337,7 +335,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                 x_original, x_related = generate_related(x_related, x_original, args)
                 x_original = cudaize(x_original, is_data_tensor=True)
 
-                # run the VAE + the DNN and gather the loss function
+                # run the model and gather the loss map
                 output_map = model(x_original, x_related)
                 loss_t = model.loss_function(x_related, labels, output_map)
 
@@ -432,7 +430,7 @@ def get_model_and_loader():
     loader = get_loader(args, transform=None, sequentially_merge_test=False,
                         window_size=args.window_size,
                         max_img_percent=args.max_image_percentage,
-                        differentiable_image_size=args.differentiable_image_size,
+                        crop_padding=args.crop_padding,
                         postfix="_large")
 
     # append the image shape to the config & build the VAE
@@ -539,7 +537,7 @@ def run(args):
 
             # adjust the LR if using momentum sgd
             if args.optimizer == 'sgd_momentum':
-                adjust_learning_rate(optimizer, args.lr, epoch)
+                decay_lr_every(optimizer, args.lr, epoch)
 
 
         grapher.save() # save to endpoint after training
