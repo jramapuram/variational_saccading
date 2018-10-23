@@ -3,6 +3,7 @@ import gc
 import time
 import psutil
 import argparse
+import functools
 import numpy as np
 import pprint
 import torchvision
@@ -12,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 from torch.autograd import Variable
-from torchvision.models.resnet import resnet18
+from torchvision.models.resnet import resnet18, conv3x3, ResNet
 from torchvision.models import vgg16_bn
 
 
@@ -62,8 +63,10 @@ parser.add_argument('--downsample-scale', type=int, default=7,
 # Model parameters
 parser.add_argument('--baseline', type=str, default='resnet18',
                     help='baseline model to use (resnet18/vgg16_bn) (default: resnet18)')
-parser.add_argument('--conv-normalization', type=str, default='groupnorm',
-                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
+parser.add_argument('--dropout', type=float, default=0,
+                    help='dropout percentage (default: 0)')
+parser.add_argument('--pre-dropout', action='store_true', default=False,
+                    help='pre-dropout vs. post-dropout, needs dropout > 0.0 (default: False)')
 parser.add_argument('--dense-normalization', type=str, default='batchnorm',
                     help='normalization type: batchnorm/instancenorm/none (default: batchnorm)')
 parser.add_argument('--restore', type=str, default=None,
@@ -118,6 +121,65 @@ if args.half is True:
 
 # Global counter
 TOTAL_ITER = 0
+
+
+# custom resnet block with dropout
+class BasicDropoutBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1,
+                 downsample=None, dropout=0.5, pre_dropout=False):
+        super(BasicDropoutBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        if dropout > 0:
+            self.do1 = nn.Dropout2d(p=dropout)
+
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+        self.pre_dropout = pre_dropout
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        if self.pre_dropout and hasattr(self, 'do1'):
+            # pre-dropout
+            out = self.do1(out)
+
+        out = self.bn1(out)
+        out = self.relu(out)
+        if not self.pre_dropout and hasattr(self, 'do1'):
+            # post dropout
+            out = self.do1(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+def resnet18_dropout(pretrained=False, **kwargs):
+    """Constructs a ResNet-18 model with dropout.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    # def __init__(self, inplanes, planes, stride=1,
+    #              downsample=None, dropout=0.5, pre_dropout=False):
+    block = functools.partial(BasicDropoutBlock,
+                              dropout=args.dropout,
+                              pre_dropout=args.pre_dropout)
+    block.expansion = 1
+    return ResNet(block, [2, 2, 2, 2], **kwargs)
 
 
 def build_optimizer(model):
@@ -374,6 +436,7 @@ def get_model_and_loader():
     model_map = {
         'vgg16_bn': vgg16_bn,
         'resnet18': resnet18,
+        'resnet18_dropout': resnet18_dropout
     }
 
     print("using {} baseline model on {}-{} with batch-size {}".format(
