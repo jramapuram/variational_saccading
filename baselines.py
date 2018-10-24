@@ -514,6 +514,9 @@ def run(args):
     # evaluate one-time metrics
     append_to_csv([test_loss['acc_mean']], "{}_test_acc.csv".format(args.uid))
 
+    # cleanups
+    grapher.close()
+
 
 if __name__ == "__main__":
     run(args)

@@ -549,6 +549,9 @@ def run(args):
     append_to_csv([test_loss], "{}_test_elbo.csv".format(args.uid))
     append_to_csv([test_acc], "{}_test_acc.csv".format(args.uid))
 
+    # cleanups
+    grapher.close()
+
 
 if __name__ == "__main__":
     run(args)
