@@ -13,14 +13,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 from torch.autograd import Variable
-from torchvision.models.resnet import resnet18, conv3x3, ResNet
+from torchvision.models.resnet import resnet18, resnet34, \
+    resnet50, resnet101, resnet152, conv3x3, ResNet
 from torchvision.models import vgg16_bn
 
 
 from models.vae.vrnn import VRNN
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
-from helpers.layers import EarlyStopping, init_weights, BWtoRGB
+from helpers.layers import EarlyStopping, init_weights
 from models.pool import train_model_pool
 from models.saccade import Saccader
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
@@ -31,7 +32,8 @@ from helpers.grapher import Grapher
 from helpers.metrics import softmax_accuracy
 from helpers.utils import same_type, ones_like, \
     append_to_csv, num_samples_in_loader, expand_dims, \
-    dummy_context, register_nan_checks, network_to_half
+    dummy_context, register_nan_checks, network_to_half, \
+    number_of_parameters, zeros, get_dtype
 
 parser = argparse.ArgumentParser(description='Variational Saccading')
 
@@ -63,6 +65,8 @@ parser.add_argument('--downsample-scale', type=int, default=7,
 # Model parameters
 parser.add_argument('--baseline', type=str, default='resnet18',
                     help='baseline model to use (resnet18/vgg16_bn) (default: resnet18)')
+parser.add_argument('--output-size', type=int, default=None,
+                    help='output class size [optional: usually auto-discovered] (default: None)')
 parser.add_argument('--dropout', type=float, default=0,
                     help='dropout percentage (default: 0)')
 parser.add_argument('--pre-dropout', action='store_true', default=False,
@@ -121,6 +125,70 @@ if args.half is True:
 
 # Global counter
 TOTAL_ITER = 0
+
+# custom block with dropout
+class DropoutBottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None,
+                 dropout=0.5, pre_dropout=False):
+        super(DropoutBottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        if dropout > 0:
+            self.do1 = nn.Dropout2d(p=dropout)
+
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+        self.pre_dropout = pre_dropout
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        if self.pre_dropout and hasattr(self, 'do1'):
+            # pre-dropout
+            out = self.do1(out)
+
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        if not self.pre_dropout and hasattr(self, 'do1'):
+            # post dropout
+            out = self.do1(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class BWtoRGB(nn.Module):
+    def __init__(self):
+        super(BWtoRGB, self).__init__()
+
+    def forward(self, x):
+        chan_dim = 1 if len(x.shape) == 4 else 2
+        chans = x.size(chan_dim)
+        if chans < 3:
+            return torch.cat([x, x, x], chan_dim)
+        else:
+            return x
 
 
 # custom resnet block with dropout
@@ -181,6 +249,57 @@ def resnet18_dropout(pretrained=False, **kwargs):
     block.expansion = 1
     return ResNet(block, [2, 2, 2, 2], **kwargs)
 
+
+def resnet34_dropout(pretrained=False, **kwargs):
+    """Constructs a ResNet-34 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    block = functools.partial(BasicDropoutBlock,
+                              dropout=args.dropout,
+                              pre_dropout=args.pre_dropout)
+    block.expansion = 1
+    return ResNet(block, [3, 4, 6, 3], **kwargs)
+
+
+def resnet50_dropout(pretrained=False, **kwargs):
+    """Constructs a ResNet-50 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    block = functools.partial(DropoutBottleneck,
+                              dropout=args.dropout,
+                              pre_dropout=args.pre_dropout)
+    block.expansion = 4
+    return ResNet(block, [3, 4, 6, 3], **kwargs)
+
+
+def resnet101_dropout(pretrained=False, **kwargs):
+    """Constructs a ResNet-101 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    block = functools.partial(DropoutBottleneck,
+                              dropout=args.dropout,
+                              pre_dropout=args.pre_dropout)
+    block.expansion = 4
+    return ResNet(block, [3, 4, 23, 3], **kwargs)
+
+
+def resnet152_dropout(pretrained=False, **kwargs):
+    """Constructs a ResNet-152 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    block = functools.partial(DropoutBottleneck,
+                              dropout=args.dropout,
+                              pre_dropout=args.pre_dropout)
+    block.expansion = 4
+    return ResNet(block, [3, 8, 36, 3], **kwargs)
 
 def build_optimizer(model):
     optim_map = {
@@ -280,10 +399,12 @@ def generate_related(data, x_original, args):
     ds_img_size = tuple(int(i) for i in np.asarray(original_img_size)
                         // args.downsample_scale)  # eg: [12, 12]
     x_downsampled = F.interpolate(
-        F.interpolate(data, ds_img_size, mode='bilinear'), # blur the crap out
-        original_img_size, mode='bilinear')             # of the original data
+        F.interpolate(data, ds_img_size, mode='bilinear', align_corners=True), # blur the crap out
+        original_img_size, mode='bilinear', align_corners=True)             # of the original data
     x_upsampled = F.interpolate(data, (args.synthetic_upsample_size,
-                                       args.synthetic_upsample_size), mode='bilinear')
+                                       args.synthetic_upsample_size),
+                                mode='bilinear',
+                                align_corners=True)
     return x_upsampled, x_downsampled
 
 
@@ -336,7 +457,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
         with torch.no_grad() if 'train' not in prefix else dummy_context():
             with torch.autograd.detect_anomaly() if args.detect_anomalies else dummy_context():
                 x_original, x_related = generate_related(x_related, x_original, args)
-                x_original = cudaize(x_original, is_data_tensor=True)
+                #x_original = cudaize(x_original, is_data_tensor=True)
 
                 # run the model and gather the loss map
                 data_to_infer = x_original if args.use_full_resolution else x_related
@@ -388,9 +509,26 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
 
     # plot images, crops, inlays and all relevant images
+    def resize_4d_or_5d(img):
+        if len(img.shape) == 4:
+            return F.interpolate(img, (32, 32),
+                                 mode='bilinear',
+                                 align_corners=True)
+        elif len(img.shape) == 5:
+            return torch.cat([F.interpolate(img[:, i, :, :, :], (32, 32),
+                                            mode='bilinear',
+                                            align_corners=True)
+                              for i in range(img.shape[1])], 0)
+        else:
+            raise Exception("only 4d or 5d images supported")
+
+    # input_imgs_map = {
+    #     'related_imgs': F.interpolate(x_related, (32, 32), mode='bilinear', align_corners=True),
+    #     'original_imgs': F.interpolate(x_original, (32, 32), mode='bilinear', align_corners=True)
+    # }
     input_imgs_map = {
-        'related_imgs': F.interpolate(x_related, (32, 32), mode='bilinear'),
-        'original_imgs': F.interpolate(x_original, (32, 32), mode='bilinear')
+        'related_imgs': resize_4d_or_5d(x_related),
+        'original_imgs': resize_4d_or_5d(x_original)
     }
     register_images(input_imgs_map, grapher, prefix=prefix)
     grapher.show()
@@ -427,29 +565,42 @@ def test(epoch, model, loader, grapher, prefix='test'):
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
+    aux_transform = None
+    if args.synthetic_upsample_size > 0 and args.task == "multi_image_folder":
+        to_pil = torchvision.transforms.ToPILImage()
+        to_tensor = torchvision.transforms.ToTensor()
+        resizer = torchvision.transforms.Resize(size=(args.synthetic_upsample_size,
+                                                      args.synthetic_upsample_size),
+                                                interpolation=2)
+        fivecrop1 = torchvision.transforms.FiveCrop(size=(896, 896))
+        fivecrop2 = torchvision.transforms.FiveCrop(size=(448, 448))
+        fivecrop3 = torchvision.transforms.FiveCrop(size=(224, 224))
+        #tencrop = torchvision.transforms.TenCrop(size=(224, 224))
+
+        def _five_five_five_crops(crop):
+            five_crops = fivecrop1(crop)
+            all_crops = [fivecrop2(fc) for fc in five_crops]
+            all_crops = [item for sublist in all_crops for item in sublist]
+            all_crops = [fivecrop3(fc) for fc in all_crops]
+            return [item for sublist in all_crops for item in sublist]
+
+        combiner = torchvision.transforms.Lambda(
+            lambda crops: torch.stack([to_tensor(crop) for crop in crops])
+        )
+
+        # now build the transform
+        aux_transform = lambda x: combiner(_five_five_five_crops(
+            resizer(to_pil(to_tensor(x)))
+        ))
+
     loader = get_loader(args, transform=None,
                         sequentially_merge_test=False,
-                        postfix="_large")
+                        aux_transform=aux_transform,
+                        postfix="_large", **vars(args))
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
-    model_map = {
-        'vgg16_bn': vgg16_bn,
-        'resnet18': resnet18,
-        'resnet18_dropout': resnet18_dropout
-    }
-
-    print("using {} baseline model on {}-{} with batch-size {}".format(
-        args.baseline,
-        args.task,
-        "full" if args.use_full_resolution else "truncated",
-        args.batch_size
-    ))
-    model = nn.Sequential(
-            BWtoRGB(),
-            nn.Upsample(size=[224, 224], mode='bilinear'),
-            model_map[args.baseline](num_classes=loader.output_size)
-        )
+    model = MultiBatchModule(loader.output_size)
 
     # FP16-ize, cuda-ize and parallelize (if requested)
     model = model.half() if args.half is True else model
@@ -470,6 +621,63 @@ def get_model_and_loader():
     return [model, loader, grapher]
 
 
+class MultiBatchModule(nn.Module):
+    def __init__(self, output_size, latent_size=256):
+        super(MultiBatchModule, self).__init__()
+        self.output_size = output_size
+        self.latent_size = latent_size
+        self.model, self.proj = self.get_model()
+
+    def forward(self, x):
+        logits = zeros((x.size(0), self.latent_size),
+                       cuda=args.cuda, dtype=get_dtype(x))
+        if len(x.shape) == 5:
+            for i in range(x.size(1)):
+                x_single = x[:, i, :, :, :].cuda()
+                logits = logits + self.model(x_single)
+                del x_single
+        else:
+            logits = self.model(x.cuda())
+
+        return self.proj(logits)
+
+    def get_model(self):
+        model_map = {
+            'vgg16_bn': vgg16_bn,
+            'resnet18': resnet18,
+            'resnet34': resnet34,
+            'resnet50': resnet50,
+            'resnet101': resnet101,
+            'resnet152': resnet152,
+            'resnet18_dropout': resnet18_dropout,
+            'resnet34_dropout': resnet34_dropout,
+            'resnet50_dropout': resnet50_dropout,
+            'resnet101_dropout': resnet101_dropout,
+            'resnet152_dropout': resnet152_dropout
+        }
+
+        print("using {} baseline model on {}-{} with batch-size {}".format(
+            args.baseline,
+            args.task,
+            "full" if args.use_full_resolution else "truncated",
+            args.batch_size
+        ))
+
+        model = nn.Sequential(
+            BWtoRGB(),
+            nn.Upsample(size=[224, 224], mode='bilinear', align_corners=True),
+            model_map[args.baseline](num_classes=self.latent_size)
+        )
+
+        # takes the output of the sum of logits and projects to output
+        proj = nn.Sequential(
+            nn.BatchNorm1d(self.latent_size, self.latent_size),
+            nn.ReLU(),
+            nn.Linear(self.latent_size, self.output_size)
+        )
+        return model, proj
+
+
 def get_name():
     return "{}_{}_{}{}_batch{}".format(
         args.uid,
@@ -482,6 +690,7 @@ def get_name():
 def run(args):
     # collect our model and data loader
     model, loader, grapher = get_model_and_loader()
+    print("model has {} params".format(number_of_parameters(model)))
 
     # collect our optimizer
     optimizer = build_optimizer(model)

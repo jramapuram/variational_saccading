@@ -106,6 +106,10 @@ class SpatialTransformer(nn.Module):
         theta_inv = SpatialTransformer.expand_z_where(
             SpatialTransformer.z_where_inv(z_where, clip_scale=max_scale)
         )
-        grid = F.affine_grid(theta_inv, torch.Size((n, 1, window_size, window_size)))
-        out = F.grid_sample(images.view(n, *image_size), grid)
-        return out
+        if z_where.is_cuda: # do ST in half precision to improve memory
+            theta_inv_trunc = theta_inv.half()
+            images_trunc = images.half()
+
+        grid = F.affine_grid(theta_inv_trunc, torch.Size((n, 1, window_size, window_size)))
+        out = F.grid_sample(images_trunc.view(n, *image_size), grid)
+        return out.type(z_where.dtype)

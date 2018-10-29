@@ -53,6 +53,7 @@ class ImageStateProjector(nn.Module):
         )
 
         # takes the state + output of conv and projects it
+        # the +1 is for ACT
         state_projector = nn.Sequential(
             self._get_dense(name='state_proj')(
                 self.config['latent_size']*2, self.config['latent_size']+1,

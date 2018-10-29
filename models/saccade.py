@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros, get_dtype, \
-    plot_tensor_grid
+    plot_tensor_grid, add_noise_to_imgs
 from helpers.layers import View
 from .image_state_projector import ImageStateProjector
 from .numerical_diff_module import NumericalDifferentiator
@@ -291,7 +291,8 @@ class Saccader(nn.Module):
 
                 # do preds and sum
                 state = torch.mean(self.vae.memory.get_state()[0], 0)
-                state_proj = self.latent_projector(x_trunc_t['crops_pred'], state)
+                crops_pred_perturbed = add_noise_to_imgs(x_trunc_t['crops_pred']) # add noise
+                state_proj = self.latent_projector(crops_pred_perturbed, state)
                 x_preds = x_preds + state_proj[:, 0:-1] # last bit is for ACT
 
                 # decode the posterior

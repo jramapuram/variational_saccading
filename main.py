@@ -7,6 +7,7 @@ import numpy as np
 import pprint
 import torchvision
 import torch
+import functools
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +22,7 @@ from helpers.layers import EarlyStopping, init_weights
 from models.pool import train_model_pool
 from models.saccade import Saccader
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
+from datasets.utils import normalize_images
 from optimizers.adamnormgrad import AdamNormGrad
 from optimizers.adamw import AdamW
 from optimizers.utils import decay_lr_every
@@ -28,7 +30,8 @@ from helpers.grapher import Grapher
 from helpers.metrics import softmax_accuracy
 from helpers.utils import same_type, ones_like, \
     append_to_csv, num_samples_in_loader, expand_dims, \
-    dummy_context, register_nan_checks, network_to_half
+    dummy_context, register_nan_checks, network_to_half, \
+    number_of_parameters
 
 parser = argparse.ArgumentParser(description='Variational Saccading')
 
@@ -66,6 +69,8 @@ parser.add_argument('--activation', type=str, default='identity',
                     help='default activation function (default: identity)')
 parser.add_argument('--latent-size', type=int, default=512, metavar='N',
                     help='sizing for latent layers (default: 256)')
+parser.add_argument('--output-size', type=int, default=None,
+                    help='output class size [optional: usually auto-discovered] (default: None)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='beta',
@@ -153,8 +158,10 @@ if args.cuda:
 # handle randomness / non-randomness
 if args.seed is not None:
     print("setting seed %d" % args.seed)
-    numpy.random.seed(args.seed)
-    torch.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed_all(args.seed)
 
 # import FP16 optimizer and module
 if args.half is True:
@@ -203,18 +210,6 @@ def register_plots(loss, grapher, epoch, prefix='train'):
             value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
             grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
-
-# def register_internal_images(images, names, grapher, prefix="train"):
-#         ''' helper to register a list of images '''
-#         if isinstance(images, list):
-#             assert len(images) == len(names), "#images[{}] != #names[{}]".format(
-#                 len(images), len(names))
-#             for im, name in zip(images, names):
-#                 register_images(im, name, grapher, prefix=prefix)
-#         else:
-#             #images = torch.min(images.detach(), ones_like(images))
-#             grapher.add_image('{}_{}'.format(prefix, names),
-#                               images.detach(), 0)
 
 def register_images(output_map, grapher, prefix='train'):
     ''' helper to register all plots with *_img and *_imgs
@@ -277,10 +272,11 @@ def generate_related(data, x_original, args):
     ds_img_size = tuple(int(i) for i in np.asarray(original_img_size)
                         // args.downsample_scale)  # eg: [12, 12]
     x_downsampled = F.interpolate(
-        F.interpolate(data, ds_img_size, mode='bilinear'), # blur the crap out
-        original_img_size, mode='bilinear')             # of the original data
+        F.interpolate(data, ds_img_size, mode='bilinear',  align_corners=True), # blur the crap out
+        original_img_size, mode='bilinear', align_corners=True) # of the original data
     x_upsampled = F.interpolate(data, (args.synthetic_upsample_size,
-                                       args.synthetic_upsample_size), mode='bilinear')
+                                       args.synthetic_upsample_size),
+                                mode='bilinear', align_corners=True)
     return x_upsampled, x_downsampled
 
 
@@ -368,7 +364,9 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean']
 
-    print('''{}[Epoch {}][{} samples][{:.2f} sec]:Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tAcc: {:.4f}'''.format(
+    print('{}[Epoch {}][{} samples][{:.2f} sec]:\
+    Average loss: {:.4f}\tKLD: {:.4f}\t\
+    NLL: {:.4f}\tAcc: {:.4f}'.format(
         prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['kld_mean'].item(),
@@ -391,12 +389,12 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     input_imgs_map = {'related_imgs': x_related, 'original_imgs': x_original}
     imgs_map = model.get_imgs(x_related.size(0), output_map, input_imgs_map)
     register_images(imgs_map, grapher, prefix=prefix)
-    grapher.show()
 
     # return this for early stopping
     loss_val = {
         'loss_mean': loss_map['loss_mean'].clone().detach().item(),
-        'pred_loss_mean': loss_map['pred_loss_mean'].clone().detach().item()
+        'pred_loss_mean': loss_map['pred_loss_mean'].clone().detach().item(),
+        'accuracy_mean': correct_percent
     }
 
     # delete the data instances, see https://tinyurl.com/ycjre67m
@@ -407,8 +405,8 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     del x_related; del x_original; del labels
     gc.collect()
 
-    # return loss and accuracy
-    return loss_val, correct_percent
+    # return loss scalar map
+    return loss_val
 
 
 def train(epoch, model, optimizer, loader, grapher, prefix='train'):
@@ -427,11 +425,17 @@ def test(epoch, model, loader, grapher, prefix='test'):
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
-    loader = get_loader(args, transform=None, sequentially_merge_test=False,
-                        window_size=args.window_size,
-                        max_img_percent=args.max_image_percentage,
-                        crop_padding=args.crop_padding,
-                        postfix="_large")
+    aux_transform = None
+    if args.synthetic_upsample_size > 0 and args.task == "multi_image_folder":
+        aux_transform = lambda x: F.interpolate(torchvision.transforms.ToTensor()(x).unsqueeze(0),
+                                                size=(args.synthetic_upsample_size,
+                                                      args.synthetic_upsample_size),
+                                                mode='bilinear', align_corners=True).squeeze(0)
+
+    loader = get_loader(args, transform=None,
+                        sequentially_merge_test=False,
+                        aux_transform=aux_transform,
+                        postfix="_large", **vars(args))
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
@@ -483,7 +487,8 @@ def lazy_generate_modules(model, loader):
     # reset half tensors if requested since torch.cuda.HalfTensor has impls
     model.config['half'] = args.half
 
-    #model = init_weights(model)
+    # TODO: consider various initializations
+    # model = init_weights(model)
 
 
 def generate(epoch, model, grapher, generate_every=10):
@@ -502,19 +507,26 @@ def generate(epoch, model, grapher, generate_every=10):
         gen_map = {} # generate and place in map
         for i, sample in enumerate(samples):
             gen_map['samples{}_imgs'.format(i)] \
-                = F.interpolate(sample, (32, 32), mode='bilinear')
+                = F.interpolate(sample, (32, 32), mode='bilinear', align_corners=True)
 
         register_images(gen_map, grapher, prefix="generated")
-        grapher.show()
 
         # XXX: memory cleanups
         gen_map.clear()
         del samples; gc.collect()
 
 
+def scalar_map_to_csvs(scalar_map, prefix='test'):
+    ''' iterates over map and writes all items with _mean or _scalar fields to csv'''
+    for k,v in scalar_map.items():
+        if 'mean' in k or 'scalar' in k:
+            append_to_csv([v], "{}_{}_{}.csv".format(args.uid, prefix, k))
+
+
 def run(args):
     # collect our model and data loader
     model, loader, grapher = get_model_and_loader()
+    print("model has {} params".format(number_of_parameters(model)))
 
     # collect our optimizer
     optimizer = build_optimizer(model)
@@ -524,21 +536,20 @@ def run(args):
         print("training current distribution for {} epochs".format(args.epochs))
         early = EarlyStopping(model, burn_in_interval=100, max_steps=80) if args.early_stop else None
 
-        test_loss, test_acc = 0.0, 0.0
+        test_map = {}
         for epoch in range(1, args.epochs + 1):
             generate(epoch, model, grapher)
             train(epoch, model, optimizer, loader.train_loader, grapher)
-            test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
+            test_map = test(epoch, model, loader.test_loader, grapher)
 
-            if args.early_stop and early(test_loss['pred_loss_mean']):
-                early.restore() # restore and test+generate again
-                test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
+            if args.early_stop and early(test_map['pred_loss_mean']):
+                early.restore() # restore and test again
+                test_map = test(epoch, model, loader.test_loader, grapher)
                 break
 
             # adjust the LR if using momentum sgd
             if args.optimizer == 'sgd_momentum':
                 decay_lr_every(optimizer, args.lr, epoch)
-
 
         grapher.save() # save to endpoint after training
     else:
@@ -546,8 +557,7 @@ def run(args):
         test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)
 
     # evaluate one-time metrics
-    append_to_csv([test_loss], "{}_test_elbo.csv".format(args.uid))
-    append_to_csv([test_acc], "{}_test_acc.csv".format(args.uid))
+    scalar_map_to_csvs(test_map)
 
     # cleanups
     grapher.close()
