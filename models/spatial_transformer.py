@@ -109,6 +109,9 @@ class SpatialTransformer(nn.Module):
         if z_where.is_cuda: # do ST in half precision to improve memory
             theta_inv_trunc = theta_inv.half()
             images_trunc = images.half()
+        else:
+            theta_inv_trunc = theta_inv
+            images_trunc = images
 
         grid = F.affine_grid(theta_inv_trunc, torch.Size((n, 1, window_size, window_size)))
         out = F.grid_sample(images_trunc.view(n, *image_size), grid)

@@ -16,6 +16,7 @@ from torch.autograd import Variable
 from torchvision.models.resnet import resnet18, resnet34, \
     resnet50, resnet101, resnet152, conv3x3, ResNet
 from torchvision.models import vgg16_bn
+from torch.utils.checkpoint import checkpoint
 
 
 from models.vae.vrnn import VRNN
@@ -566,7 +567,7 @@ def test(epoch, model, loader, grapher, prefix='test'):
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     aux_transform = None
-    if args.synthetic_upsample_size > 0 and args.task == "multi_image_folder":
+    if args.synthetic_upsample_size > 0: #and args.task == "multi_image_folder":
         to_pil = torchvision.transforms.ToPILImage()
         to_tensor = torchvision.transforms.ToTensor()
         resizer = torchvision.transforms.Resize(size=(args.synthetic_upsample_size,
@@ -577,23 +578,49 @@ def get_model_and_loader():
         fivecrop3 = torchvision.transforms.FiveCrop(size=(224, 224))
         #tencrop = torchvision.transforms.TenCrop(size=(224, 224))
 
-        def _five_five_five_crops(crop):
-            five_crops = fivecrop1(crop)
-            all_crops = [fivecrop2(fc) for fc in five_crops]
-            all_crops = [item for sublist in all_crops for item in sublist]
-            all_crops = [fivecrop3(fc) for fc in all_crops]
-            return [item for sublist in all_crops for item in sublist]
+        def extract_patches_2D(img, size):
+            patch_H, patch_W = min(img.size(2),size[0]),min(img.size(3),size[1])
+            patches_fold_H = img.unfold(2, patch_H, patch_H)
+            if(img.size(2) % patch_H != 0):
+                patches_fold_H = torch.cat((
+                    patches_fold_H,
+                    img[:,:,-patch_H:,].permute(0,1,3,2).unsqueeze(2)
+                ), dim=2)
+                patches_fold_HW = patches_fold_H.unfold(3, patch_W, patch_W)
 
-        combiner = torchvision.transforms.Lambda(
-            lambda crops: torch.stack([to_tensor(crop) for crop in crops])
-        )
+            if(img.size(3) % patch_W != 0):
+                patches_fold_HW = torch.cat((
+                    patches_fold_HW,
+                    patches_fold_H[:,:,:,-patch_W:,:].permute(0,1,2,4,3).unsqueeze(3)
+                ), dim=3)
+
+                patches = patches_fold_HW.permute(0,2,3,1,4,5).reshape(-1,img.size(1),patch_H,patch_W)
+
+            return patches
+
+        def _five_five_five_crops(crop):
+            # five_crops = fivecrop1(crop)
+            # all_crops = [fivecrop2(fc) for fc in five_crops]
+            # all_crops = [item for sublist in all_crops for item in sublist]
+            # all_crops = [fivecrop3(fc) for fc in all_crops]
+            # return [item for sublist in all_crops for item in sublist]
+            #print('shp = ', resizer(crop).transpose(0, 2).numpy().shape)
+
+            crop = crop.unsqueeze(0) if len(crop.shape) < 4 else crop
+            return extract_patches_2D(crop, [224, 224])
+
+        # combiner = torchvision.transforms.Lambda(
+        #     lambda crops: torch.stack([to_tensor(crop) for crop in crops])
+        # )
 
         # now build the transform
-        aux_transform = lambda x: combiner(_five_five_five_crops(
-            resizer(to_pil(to_tensor(x)))
-        ))
+        # aux_transform = lambda x: combiner(_five_five_five_crops(
+        #     to_tensor(resizer(to_pil(to_tensor(x))))
+        #     #to_pil(to_tensor(x))
+        # ))
+        aux_transform = lambda x: _five_five_five_crops(to_tensor(resizer(to_pil(to_tensor(x)))))
 
-    loader = get_loader(args, transform=None,
+    loader = get_loader(args, transform=None,#[aux_transform],
                         sequentially_merge_test=False,
                         aux_transform=aux_transform,
                         postfix="_large", **vars(args))
@@ -628,14 +655,41 @@ class MultiBatchModule(nn.Module):
         self.latent_size = latent_size
         self.model, self.proj = self.get_model()
 
-    def forward(self, x):
+    def forward(self, x, step=11):
         logits = zeros((x.size(0), self.latent_size),
-                       cuda=args.cuda, dtype=get_dtype(x))
+                       cuda=args.cuda, dtype=get_dtype(x)).requires_grad_()
+        #print("x = ", x.shape)
         if len(x.shape) == 5:
-            for i in range(x.size(1)):
-                x_single = x[:, i, :, :, :].cuda()
-                logits = logits + self.model(x_single)
-                del x_single
+            assert (x.shape[1] - 1) % step == 0, "crops{} need to be div by {}".format(
+                x.shape[1], step
+            )
+
+            def _run_k(*args):
+                x, begin, end, logits = args[0], args[1], args[2], args[3]
+                for i in range(begin.item(), end.item()):
+                    #print("i = ", i)
+                    logits = logits + self.model(
+                        x[:, i, :, :, :].cuda().requires_grad_()
+                    )
+
+                return logits
+
+            # need to run last separately as per pytorch repo
+            # let the +1-1 intentionally for understanding
+            for begin, end in zip(range(0, x.size(1)-1, step),
+                                  range(step, x.size(1)+1-1, step)):
+                #print("begin = ", begin, " | end = ", end)
+                logits = checkpoint(_run_k, x, torch.Tensor([begin]).type(torch.int32),
+                                    torch.Tensor([end]).type(torch.int32), logits)
+
+            # for i in range(0, x.size(1) - 1):
+            #     x_single = x[:, i, :, :, :].cuda()
+            #     logits = logits + self.model(x_single)
+            #     del x_single
+
+            # run last one outside checkpointing
+            x_single = x[:, -1, :, :, :].cuda().requires_grad_()
+            logits = logits + self.model(x_single)
         else:
             logits = self.model(x.cuda())
 
@@ -671,11 +725,104 @@ class MultiBatchModule(nn.Module):
 
         # takes the output of the sum of logits and projects to output
         proj = nn.Sequential(
-            nn.BatchNorm1d(self.latent_size, self.latent_size),
+            nn.BatchNorm1d(self.latent_size),
+            nn.ReLU(),
+            nn.Linear(self.latent_size, self.latent_size),
+            nn.BatchNorm1d(self.latent_size),
             nn.ReLU(),
             nn.Linear(self.latent_size, self.output_size)
         )
         return model, proj
+
+# class MultiBatchModule(nn.Module):
+#     def __init__(self, output_size, latent_size=10):
+#         super(MultiBatchModule, self).__init__()
+#         self.output_size = output_size
+#         self.latent_size = latent_size
+#         self.model, self.proj = self.get_model()
+
+#     def forward(self, x, step=11):
+#         assert len(x.shape) == 5
+#         feature_size = self.latent_size*x.size(1)
+#         logits = zeros((x.size(0), feature_size),
+#                        cuda=args.cuda, dtype=get_dtype(x)).requires_grad_()
+#         #print("x = ", x.shape)
+#         assert (x.shape[1] - 1) % step == 0, "crops{} need to be div by {}".format(
+#             x.shape[1], step
+#         )
+
+#         def _run_k(*args):
+#             x, begin, end, logits = args[0], args[1], args[2], args[3]
+#             for i in range(begin.item(), end.item()):
+#                 #print("i = ", i)
+#                 logits[:, i*self.latent_size:(i*self.latent_size) + self.latent_size] = self.model(x[:, i, :, :, :].cuda())
+#                 #print(i*self.latent_size, (i*self.latent_size)+self.latent_size)
+#                 #logits = logits + self.model(x[:, i, :, :, :].cuda())
+
+#             return logits
+
+#         # need to run last separately as per pytorch repo
+#         # let the +1-1 intentionally for understanding
+#         for begin, end in zip(range(0, x.size(1)-1, step),
+#                               range(step, x.size(1)+1-1, step)):
+#             #print("begin = ", begin, " | end = ", end)
+#             logits = checkpoint(_run_k, x, torch.Tensor([begin]).type(torch.int32),
+#                                 torch.Tensor([end]).type(torch.int32), logits)
+
+#         # for i in range(0, x.size(1) - 1):
+#         #     x_single = x[:, i, :, :, :].cuda()
+#         #     logits = logits + self.model(x_single)
+#         #     del x_single
+
+#         # run last one outside checkpointing
+#         x_single = x[:, -1, :, :, :].cuda()
+#         #print((x.size(1)-1)*self.latent_size, ((x.size(1)-1)*self.latent_size)+self.latent_size)
+#         logits[:, (x.size(1)-1)*self.latent_size:((x.size(1)-1)*self.latent_size)+self.latent_size] \
+#             = self.model(x_single)
+
+#         # proj through DNN
+#         return self.proj(logits)
+
+#     def get_model(self):
+#         model_map = {
+#             'vgg16_bn': vgg16_bn,
+#             'resnet18': resnet18,
+#             'resnet34': resnet34,
+#             'resnet50': resnet50,
+#             'resnet101': resnet101,
+#             'resnet152': resnet152,
+#             'resnet18_dropout': resnet18_dropout,
+#             'resnet34_dropout': resnet34_dropout,
+#             'resnet50_dropout': resnet50_dropout,
+#             'resnet101_dropout': resnet101_dropout,
+#             'resnet152_dropout': resnet152_dropout
+#         }
+
+#         print("using {} baseline model on {}-{} with batch-size {}".format(
+#             args.baseline,
+#             args.task,
+#             "full" if args.use_full_resolution else "truncated",
+#             args.batch_size
+#         ))
+
+#         model = nn.Sequential(
+#             BWtoRGB(),
+#             nn.Upsample(size=[224, 224], mode='bilinear', align_corners=True),
+#             model_map[args.baseline](num_classes=self.latent_size)
+#         )
+
+#         # takes the output of the sum of logits and projects to output
+#         feature_size = self.latent_size * 144
+#         proj = nn.Sequential(
+#             nn.BatchNorm1d(feature_size),
+#             nn.ReLU(),
+#             nn.Linear(feature_size, 128),
+#             nn.BatchNorm1d(128),
+#             nn.ReLU(),
+#             nn.Linear(128, self.output_size)
+#         )
+#         return model, proj
+
 
 
 def get_name():
@@ -705,7 +852,7 @@ def run(args):
             train(epoch, model, optimizer, loader.train_loader, grapher)
             test_loss = test(epoch, model, loader.test_loader, grapher)
 
-            if args.early_stop and early(test_loss['pred_loss_mean']):
+            if args.early_stop and early(test_loss['loss_mean']):
                 early.restore() # restore and test+generate again
                 test_loss = test(epoch, model, loader.test_loader, grapher)
                 break

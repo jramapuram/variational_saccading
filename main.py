@@ -27,7 +27,7 @@ from optimizers.adamnormgrad import AdamNormGrad
 from optimizers.adamw import AdamW
 from optimizers.utils import decay_lr_every
 from helpers.grapher import Grapher
-from helpers.metrics import softmax_accuracy
+from helpers.metrics import softmax_accuracy, bce_accuracy
 from helpers.utils import same_type, ones_like, \
     append_to_csv, num_samples_in_loader, expand_dims, \
     dummy_context, register_nan_checks, network_to_half, \
@@ -48,21 +48,21 @@ parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
-parser.add_argument('--early-stop', action='store_true',
+parser.add_argument('--early-stop', action='store_true', default=False,
                     help='enable early stopping (default: False)')
 
 # handle scaling of images and related imgs
 parser.add_argument('--synthetic-upsample-size', type=int, default=0,
                     help="""size to upsample image before downsampling to
                     blurry version for synthetic problems (default: 0)""")
-parser.add_argument('--max-image-percentage', type=float, default=0.15,
+parser.add_argument('--max-image-percentage', type=float, default=0.3,
                     help='maximum percentage of the image to look over (default: 0.15)')
 parser.add_argument('--window-size', type=int, default=32,
                     help='window size for saccades [becomes WxW] (default: 32)')
 parser.add_argument('--crop-padding', type=int, default=6,
                     help='the extra padding around the crop for numerical diff (default: 6)')
-parser.add_argument('--downsample-scale', type=int, default=7,
-                    help='downscale the image by this scalar, eg: [100 // 8 , 100 // 8] (default: 8)')
+parser.add_argument('--downsample-scale', type=int, default=5,
+                    help='downscale the image by this scalar, eg: [100 // 5 , 100 // 5] (default: 5)')
 
 # Model parameters
 parser.add_argument('--activation', type=str, default='identity',
@@ -71,6 +71,8 @@ parser.add_argument('--latent-size', type=int, default=512, metavar='N',
                     help='sizing for latent layers (default: 256)')
 parser.add_argument('--output-size', type=int, default=None,
                     help='output class size [optional: usually auto-discovered] (default: None)')
+parser.add_argument('--add-img-noise', action='store_true',
+                    help='add scattered noise to  images (default: False)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='beta',
@@ -336,7 +338,8 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                 loss_t = model.loss_function(x_related, labels, output_map)
 
                 # compute accuracy and aggregate into map
-                loss_t['accuracy_mean'] = softmax_accuracy(
+                accuracy_fn = softmax_accuracy if len(labels.shape) == 1 else bce_accuracy
+                loss_t['accuracy_mean'] = accuracy_fn(
                     F.softmax(output_map['preds'], -1),
                     labels, size_average=True
                 )
@@ -355,7 +358,8 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
+                torch.nn.utils.clip_grad_value_(model.parameters(), args.clip) \
                     if not args.half is True else optimizer.clip_master_grads(args.clip)
 
             optimizer.step()
@@ -441,7 +445,8 @@ def get_model_and_loader():
     args.img_shp = loader.img_shp
     vae = VRNN(loader.img_shp,
                n_layers=2,            # XXX: hard coded
-               bidirectional=True,    # XXX: hard coded
+               #bidirectional=True,    # XXX: hard coded
+               bidirectional=False,    # XXX: hard coded
                kwargs=vars(args))
 
     # build the Variational Saccading module
