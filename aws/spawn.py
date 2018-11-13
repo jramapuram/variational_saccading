@@ -148,6 +148,7 @@ def create_spot(args):
             InstanceCount=args.number_of_instances,
             LaunchSpecification=launch_spec_dict
         )
+        time.sleep(5) # XXX: sometimes remote doesn't update fast enough
         #print("\ninstance_request = {}\n".format(instance_request))
 
         # return the requested instances
@@ -214,21 +215,9 @@ def create_ondemand(args):
         print(exe)
 
 
-def get_setup_machine_str():
-    # install some simple dependencies
-    #setup_cmd = "sudo apt-get update -y && \
-    #sudo apt-get install -y htop"
-
-    # setup tmux environment and log file
-    pull_tmux_cmd = "curl -L https://raw.githubusercontent.com/jramapuram/scripts/master/dotfiles/.tmux.conf -o ~/.tmux.conf"
-
-    return "{}".format(
-        pull_tmux_cmd
-    ).replace("\t", "").replace("\n", " ")
-
-
 def put_file(client, local_path, remote_path):
-    ftp_client = ssh.open_sftp()
+    ''' helper to copy a local file to a remote path'''
+    ftp_client = client.open_sftp()
     ftp_client.put(local_path, remote_path)
     ftp_client.close()
 
@@ -239,22 +228,31 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    # format the commands to use
-    setup_cmd = get_setup_machine_str()
+    # format the commands to use, the order of ops is:
+    # tmux_setup --> setup.sh --> yourfile.sh --> log -->shutdown
+    tmux_cmd = "curl -L https://tinyurl.com/y8osnam8 -o ~/.tmux.conf"
+    setup_cmd = "sh /tmp/setup.sh"
     shutdown_cmd = "sudo shutdown -P now" if terminate_on_completion else ""
-    log_cmd = "aws s3 cp ~/cmd.log {}/{}_cmd.log".format(
+    log_cmd = "aws s3 cp ~/setup.log {}/{}_setup.log ;\
+    aws s3 cp ~/cmd.log {}/{}_cmd.log".format(
+        args.log_bucket, hostname.replace(".", "_"),
         args.log_bucket, hostname.replace(".", "_")
     )
 
-    # build the final command
+    # build the final command to send over ssh
     cmd = "{} ; tmux new-session -d -s runtime; \
-    tmux send-keys \"{} > ~/cmd.log ; {} ; {} \" C-m ; \
+    tmux send-keys \"{} > ~/setup.log ; sh /tmp/{} > ~/cmd.log ; {} ; {} \" C-m ; \
     tmux detach -s runtime".format(
-        setup_cmd, cmd, log_cmd, shutdown_cmd
+        tmux_cmd, setup_cmd, cmd, log_cmd, shutdown_cmd
     )
 
     # setup client
     client.connect(hostname=hostname, username=username, pkey=key)
+
+    # send all files from current directory to remote server
+    for local_file in os.listdir("."):
+        remote_file = os.path.join("/tmp", os.path.basename(local_file))
+        put_file(client, local_file, remote_file)
 
     # run async
     if background:
