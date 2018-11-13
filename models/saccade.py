@@ -30,10 +30,9 @@ class Saccader(nn.Module):
                                        max_image_percentage=self.config['max_image_percentage'])
         else:
             self.pool = CropLambdaPool(num_workers=self.config['batch_size'])
-            #self.pool = CropLambdaPool(num_workers=1)  # disables
-            #self.pool = CropLambdaPool(num_workers=-1) # auto-pool
-            #self.pool = CropLambdaPool(num_workers=24) # fixed pool
-
+            # self.pool = CropLambdaPool(num_workers=1)  # disables
+            # self.pool = CropLambdaPool(num_workers=-1) # auto-pool
+            # self.pool = CropLambdaPool(num_workers=24) # fixed pool
 
         # build the projection to softmax from RNN state
         self.latent_projector = ImageStateProjector(output_size=self.output_size,
@@ -114,7 +113,7 @@ class Saccader(nn.Module):
         for name, img in input_imgs_map.items():
             if isinstance(img, torch.Tensor):
                 return_map[name] = F.interpolate(img, resize, mode='bilinear')
-            else: # we are in the case of lambda operands
+            else:  # we are in the case of lambda operands
                 z = np.tile(np.array([[1.0, 0.0, 0.0]]), (batch_size, 1))
                 #original_full_img, _, _ = self._pool_to_imgs(z, img, override=True)
                 original_full_img = self._pool_to_imgs(z, img, override=True)
@@ -122,15 +121,14 @@ class Saccader(nn.Module):
 
         return return_map
 
-
     def get_auxiliary_imgs(self, output_map, crop_resize=(64, 64), decode_resize=(32, 32)):
         ''' simple helper to go through the output map and grab all the images and labels'''
         imgs_map = {}
-        assert 'crops' in output_map and isinstance(output_map['crops'], list) # sanity
+        assert 'crops' in output_map and isinstance(output_map['crops'], list)  # sanity
         for i, (crop, decoded) in enumerate(zip(output_map['crops'],
                                                 output_map['decoded'])):
             imgs_map['softcrop{}_imgs'.format(i)] = F.interpolate(
-                crop, crop_resize, mode='bilinear') # grab softcrops
+                crop, crop_resize, mode='bilinear')  # grab softcrops
             imgs_map['decoded{}_imgs'.format(i)] = F.interpolate(
                 self.vae.nll_activation(decoded),   # grab decodes
                 decode_resize, mode='bilinear')
@@ -218,12 +216,11 @@ class Saccader(nn.Module):
         ''' inverts clamp to [-3, 3] '''
         clamp_map = {
             'beta': lambda z: (z * 6) - 3,               # re-normalize to [-3, 3]
-            'isotropic_gaussian': lambda z: (z * 6) - 3, # re-normalize to [-3, 3]
+            'isotropic_gaussian': lambda z: (z * 6) - 3,  # re-normalize to [-3, 3]
             'mixture': lambda z: (                       # re-normalize to [-3, 3]
                 z[:, 0:self.vae.reparameterizer.num_continuous_input] * 6) - 3
         }
         return clamp_map[self.config['reparam_type']](z)
-
 
     def _z_to_image_lambda(self, z, imgs):
         ''' run the z's through the threadpool, returning inlays and true crops'''
@@ -261,13 +258,14 @@ class Saccader(nn.Module):
         crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
         return crop_fn_map[crop_type](z, imgs)
 
+
     def generate(self, batch_size):
         self.eval()
         samples = []
         with torch.no_grad():
             for i in range(self.config['max_time_steps']):
                 samples.append(
-                    self.vae.generate_synthetic_samples(batch_size, reset_state=i==0)
+                    self.vae.generate_synthetic_samples(batch_size, reset_state=i == 0)
                 )
 
         return samples
@@ -310,7 +308,7 @@ class Saccader(nn.Module):
                 crops_pred_perturbed = add_noise_to_imgs(x_trunc_t['crops_pred']) \
                     if self.config['add_img_noise'] else x_trunc_t['crops_pred']
                 state_proj = self.latent_projector(crops_pred_perturbed, state)
-                x_preds = x_preds + state_proj[:, 0:-1] # last bit is for ACT
+                x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
 
                 # decode the posterior
                 decoded_t = self.vae.decode(z_t, produce_output=True)
@@ -350,7 +348,7 @@ class Saccader(nn.Module):
 
         #  re-eval posterior for mut-info using decoded from above
         if (self.config['continuous_mut_info'] > 0
-            or self.config['discrete_mut_info'] > 0):
+                or self.config['discrete_mut_info'] > 0):
             ''' append the posterior of re-forward passing'''
             q_z_given_x_hat = _forward_internal(standard_forward_pass['decoded'],
                                                 inference_only=True)
