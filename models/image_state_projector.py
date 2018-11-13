@@ -47,9 +47,19 @@ class ImageStateProjector(nn.Module):
                      self.config['window_size']]
 
         # main function approximator to extract crop features
+        nlayer_map = {
+            'conv': { 32: 4, 70: 6, 100: 7 },
+            'resnet': { 32: None, 64: None, 70: None, 100: None },
+            'dense': { 32: 3, 64: 3, 70: 3, 100: 3 }
+        }
+        bilinear_size = (self.config['window_size'], self.config['window_size'])
         conv = get_encoder(self.config, name='crop_feat')(
             crop_size, self.config['latent_size'],
-            activation_fn=str_to_activ_module(self.config['activation'])
+            activation_fn=str_to_activ_module(self.config['activation']),
+            num_layers=nlayer_map[
+                self.config['encoder_layer_type']][self.config['window_size']
+                ],
+            bilinear_size=bilinear_size
         )
 
         # takes the state + output of conv and projects it

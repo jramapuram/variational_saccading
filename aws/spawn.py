@@ -6,6 +6,8 @@ import argparse
 import paramiko
 import numpy as np
 
+from fabric import Connection
+
 
 parser = argparse.ArgumentParser(description='AWS Spawner')
 
@@ -20,10 +22,14 @@ parser.add_argument('--keypair', type=str, default="aws",
                     help="keypair name (default: aws)")
 parser.add_argument('--security-group', type=str, default="default",
                     help="security group (default: default)")
-parser.add_argument('--ami', type=str, default="ami-047daf3f2b162fc35",
-                    help="instance AMI (default: ami-047daf3f2b162fc35)")
+# ami-0af8dc9d28a9aed78 = ubuntu16-deeplearning base
+# ami-047daf3f2b162fc35 = ubuntu17-deeplearning all frameworks
+parser.add_argument('--ami', type=str, default="ami-0af8dc9d28a9aed78",
+                    help="instance AMI (default: ami-0af8dc9d28a9aed78)")
 parser.add_argument('--instance-region', type=str, default="us-east-1",
                     help="instance region (default: us-east-1)")
+parser.add_argument('--instance-zone', type=str, default=None,
+                    help="instance zone, uses cheapest by default (default: None)")
 parser.add_argument('--s3-iam', type=str, default='s3-access',
                     help="iam role for s3 (default: s3-iam)")
 parser.add_argument('--upper-bound-spot-multiplier', type=float, default=0,
@@ -37,6 +43,8 @@ parser.add_argument('--no-background', action='store_true', default=False,
                     help='do not run command in background (default=False)')
 parser.add_argument('--cmd', type=str, default=None,
                     help="[required] run this command in the instance (default: None)")
+parser.add_argument('--log-bucket', type=str, default="s3://jramapuram-logs",
+                    help="[required] log to this bucket (default: s3://jramapuram-logs)")
 args = parser.parse_args()
 
 
@@ -44,6 +52,7 @@ def get_all_availability_zones(client):
     '''helper to list all available zones in a region'''
     all_zones_list = client.describe_availability_zones()['AvailabilityZones']
     return [zone['ZoneName'] for zone in all_zones_list]
+
 
 def get_cheapest_price(args):
     ''' gets the cheapest current AWS spot price, returns price and zone'''
@@ -63,6 +72,7 @@ def get_cheapest_price(args):
     # return price and zone
     print("found cheapest price of {}$ in zone {}".format(cheapest_price, cheapest_zone))
     return cheapest_price, cheapest_zone
+
 
 def instances_to_ips(instance_list):
     assert isinstance(instance_list, list), "need a list as input"
@@ -91,7 +101,7 @@ def instances_to_ips(instance_list):
             total_waited_time += 1
 
     # XXX: add an extra sleep here to get ssh up
-    time.sleep(wait_interval*5)
+    time.sleep(60)
     print("{} instances successfully in running state.".format(len(instance_list)))
 
     reservations = client.describe_instances(InstanceIds=instance_list)['Reservations'][0]
@@ -121,6 +131,9 @@ def create_spot(args):
             'ImageId': args.ami,
             'KeyName': args.keypair,
             'InstanceType': args.instance_type,
+            'Placement': {
+                'AvailabilityZone': cheapest_zone if args.instance_zone is None else args.instance_zone,
+            },
             'BlockDeviceMappings': [storage_dict],
             'IamInstanceProfile': {
                 'Name': args.s3_iam
@@ -138,8 +151,8 @@ def create_spot(args):
         #print("\ninstance_request = {}\n".format(instance_request))
 
         # return the requested instances
-        instance_request_id = instance_request['SpotInstanceRequests'][0]['SpotInstanceRequestId']
-        print("spot-request-id: ", instance_request_id)
+        instance_request_ids = [ir['SpotInstanceRequestId'] for ir in instance_request['SpotInstanceRequests']]
+        print("spot-request-ids: ", instance_request_ids)
 
         # wait till full-fulled, upto 10 min
         instances, all_instances_created = [], False
@@ -149,7 +162,7 @@ def create_spot(args):
 
         while not all_instances_created:
             spot_req_response = client.describe_spot_instance_requests(
-                SpotInstanceRequestIds=[instance_request_id]
+                SpotInstanceRequestIds=instance_request_ids
             )
             #print("\nspot_req = {}\n".format(spot_req_response))
             for spot_req in spot_req_response['SpotInstanceRequests']:
@@ -201,25 +214,64 @@ def create_ondemand(args):
         print(exe)
 
 
+def get_setup_machine_str():
+    # install some simple dependencies
+    #setup_cmd = "sudo apt-get update -y && \
+    #sudo apt-get install -y htop"
+
+    # setup tmux environment and log file
+    pull_tmux_cmd = "curl -L https://raw.githubusercontent.com/jramapuram/scripts/master/dotfiles/.tmux.conf -o ~/.tmux.conf"
+
+    return "{}".format(
+        pull_tmux_cmd
+    ).replace("\t", "").replace("\n", " ")
+
+
+def put_file(client, local_path, remote_path):
+    ftp_client = ssh.open_sftp()
+    ftp_client.put(local_path, remote_path)
+    ftp_client.close()
+
+
 def run_command(cmd, hostname, pem_file, username='ubuntu',
                 background=True, terminate_on_completion=True):
     key = paramiko.RSAKey.from_private_key_file(pem_file)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    # format the command
-    shutdown_cmd = "&& sudo shutdown -h 0" if terminate_on_completion else ""
-    if background:
-        cmd = "nohup sh -c \"{} {}\" &".format(
-            cmd, shutdown_cmd
-        )
-    else:
-        cmd = "{} {}".format(
-            cmd, shutdown_cmd
-        )
+    # format the commands to use
+    setup_cmd = get_setup_machine_str()
+    shutdown_cmd = "sudo shutdown -P now" if terminate_on_completion else ""
+    log_cmd = "aws s3 cp ~/cmd.log {}/{}_cmd.log".format(
+        args.log_bucket, hostname.replace(".", "_")
+    )
 
-    # try to spin-up the command on the remote instance
+    # build the final command
+    cmd = "{} ; tmux new-session -d -s runtime; \
+    tmux send-keys \"{} > ~/cmd.log ; {} ; {} \" C-m ; \
+    tmux detach -s runtime".format(
+        setup_cmd, cmd, log_cmd, shutdown_cmd
+    )
+
+    # setup client
     client.connect(hostname=hostname, username=username, pkey=key)
+
+    # run async
+    if background:
+        print("running {} asynchronously".format(cmd))
+        transport = client.get_transport()
+        channel = transport.open_session()
+        channel.exec_command(cmd)
+        return {
+            'stdout': 'running in background',
+            'stderr': ''
+        }
+
+    # run synchronously
+    print("running {} synchronously".format(cmd))
+    cmd = "{} && {} ; {}".format(
+        setup_cmd, cmd, shutdown_cmd
+    )
     stdin, stdout, stderr = client.exec_command(cmd)
     stdout = stdout.read().decode('ascii')
     stderr = stderr.read().decode('ascii')

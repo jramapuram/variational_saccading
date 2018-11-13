@@ -18,7 +18,7 @@ from torch.autograd import Variable
 from models.vae.vrnn import VRNN
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
-from helpers.layers import EarlyStopping, init_weights
+from helpers.layers import EarlyStopping, Rotate, init_weights
 from models.pool import train_model_pool
 from models.saccade import Saccader
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
@@ -55,6 +55,8 @@ parser.add_argument('--early-stop', action='store_true', default=False,
 parser.add_argument('--synthetic-upsample-size', type=int, default=0,
                     help="""size to upsample image before downsampling to
                     blurry version for synthetic problems (default: 0)""")
+parser.add_argument('--synthetic-rotation', type=float, default=0,
+                    help='rotate proxy image in degrees (default: 0 degrees)')
 parser.add_argument('--max-image-percentage', type=float, default=0.3,
                     help='maximum percentage of the image to look over (default: 0.15)')
 parser.add_argument('--window-size', type=int, default=32,
@@ -263,8 +265,11 @@ def _mean_map(loss_map):
     return loss_map
 
 
+# create this once
+rotator = Rotate(args.synthetic_rotation)
+
 def generate_related(data, x_original, args):
-    # handle logic for crop-image-loader
+    # handle logic for crop-image-loader & multi-image-folder
     if x_original is not None:
         return x_original, data
 
@@ -279,7 +284,7 @@ def generate_related(data, x_original, args):
     x_upsampled = F.interpolate(data, (args.synthetic_upsample_size,
                                        args.synthetic_upsample_size),
                                 mode='bilinear', align_corners=True)
-    return x_upsampled, x_downsampled
+    return x_upsampled, rotator(x_downsampled)
 
 
 def _unpack_data_and_labels(item):

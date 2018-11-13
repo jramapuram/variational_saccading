@@ -3,14 +3,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 from copy import deepcopy
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros, get_dtype, \
     plot_tensor_grid, add_noise_to_imgs
-from helpers.layers import View
+from helpers.layers import View, Identity, get_encoder, str_to_activ_module
 from .image_state_projector import ImageStateProjector
 from .numerical_diff_module import NumericalDifferentiator
 from .spatial_transformer import SpatialTransformer
@@ -45,6 +44,21 @@ class Saccader(nn.Module):
 
         # build the spatial transformer
         self.spatial_transformer = SpatialTransformer(self.config)
+
+        # build the projector from the posterior to the ST params
+        self.posterior_to_st = nn.Sequential(self._get_dense('posterior_to_st_proj')(
+            self.vae.reparameterizer.output_size, 3,
+            normalization_str=self.config['dense_normalization'],
+            activation_fn=str_to_activ_module(self.config['activation'])
+        )) if self.vae.reparameterizer.output_size != 3 else Identity()
+
+        # self.posterior_to_st = nn.Linear(self.vae.reparameterizer.output_size, 3) \
+        #     if self.vae.reparameterizer.output_size != 3 else Identity()
+
+    def _get_dense(self, name):
+        config = deepcopy(self.config)
+        config['encoder_layer_type'] = 'dense'
+        return get_encoder(config, name=name)
 
     def fp16(self):
         self.latent_projector.fp16()
@@ -94,41 +108,41 @@ class Saccader(nn.Module):
             print("saving existing saccader model")
             torch.save(self, model_filename)
 
-    def get_input_imgs(self, batch_size, input_imgs_map):
+    def get_input_imgs(self, batch_size, input_imgs_map, resize=(128, 128)):
         ''' helper to take the input image map and return visdom friendly plots '''
         return_map = {}
         for name, img in input_imgs_map.items():
             if isinstance(img, torch.Tensor):
-                return_map[name] = F.interpolate(img, (32, 32), mode='bilinear')
+                return_map[name] = F.interpolate(img, resize, mode='bilinear')
             else: # we are in the case of lambda operands
                 z = np.tile(np.array([[1.0, 0.0, 0.0]]), (batch_size, 1))
                 #original_full_img, _, _ = self._pool_to_imgs(z, img, override=True)
                 original_full_img = self._pool_to_imgs(z, img, override=True)
-                return_map[name] = F.interpolate(original_full_img, (32, 32), mode='bilinear')
+                return_map[name] = F.interpolate(original_full_img, resize, mode='bilinear')
 
         return return_map
 
 
-    def get_auxiliary_imgs(self, output_map):
+    def get_auxiliary_imgs(self, output_map, crop_resize=(64, 64), decode_resize=(32, 32)):
         ''' simple helper to go through the output map and grab all the images and labels'''
         imgs_map = {}
         assert 'crops' in output_map and isinstance(output_map['crops'], list) # sanity
         for i, (crop, decoded) in enumerate(zip(output_map['crops'],
                                                 output_map['decoded'])):
             imgs_map['softcrop{}_imgs'.format(i)] = F.interpolate(
-                crop, (32, 32), mode='bilinear') # grab softcrops
+                crop, crop_resize, mode='bilinear') # grab softcrops
             imgs_map['decoded{}_imgs'.format(i)] = F.interpolate(
-                self.vae.nll_activation(decoded),      # grab decodes
-                (32, 32), mode='bilinear')
+                self.vae.nll_activation(decoded),   # grab decodes
+                decode_resize, mode='bilinear')
 
         # add the inlays and hard-crops here because they might not exist
         # for the case of just using a vanilla spatial-transformer
         for i, (crop_true, inlay) in enumerate(zip(output_map['crops_true'],
                                                    output_map['inlays'])):
             imgs_map['hardcrop{}_imgs'.format(i)] = F.interpolate(
-                crop_true, (32, 32), mode='bilinear')   # grab hardcrops
+                crop_true, crop_resize, mode='bilinear')   # grab hardcrops
             imgs_map['inlay{}_imgs'.format(i)] = F.interpolate(
-                inlay, (32, 32), mode='bilinear')       # grab the inlays
+                inlay, decode_resize, mode='bilinear')     # grab the inlays
 
         return imgs_map
 
@@ -143,12 +157,15 @@ class Saccader(nn.Module):
                                               [x.clone() for _ in range(len(output_map['decoded']))],
                                               output_map['params'])
 
-        # get classifier loss
-        pred_loss = F.cross_entropy(
+        # get classifier loss, use BCE with logits if multi-dimensional
+        loss_fn = F.binary_cross_entropy_with_logits \
+            if len(labels.shape) > 1 else F.cross_entropy
+        pred_loss = loss_fn(
             input=output_map['preds'],
             target=labels,
             reduction='none'
         )
+        pred_loss = torch.sum(pred_loss, -1) if len(pred_loss.shape) > 1 else pred_loss
         nan_check_and_break(pred_loss, "pred_loss")
 
         # the crop prediction loss [ only for lambda images ]
@@ -167,9 +184,9 @@ class Saccader(nn.Module):
         #     reduction='none'
         # )
 
-        # TODO: try multi-task loss
+        # TODO: try multi-task loss, ie:
+        # vae_loss_map['loss'] = vae_loss_map['loss'] + (pred_loss + crop_loss + act_loss)
         vae_loss_map['loss'] = vae_loss_map['loss'] * (pred_loss + crop_loss + act_loss)
-        # vae_loss_map['loss'] = self.config['max_time_steps'] * (vae_loss_map['loss'] + pred_loss)
 
         # compute the means for visualizations of bp
         vae_loss_map['act_loss_mean'] = torch.mean(act_loss)
@@ -180,7 +197,8 @@ class Saccader(nn.Module):
 
     def _z_to_image_transformer(self, z, imgs):
         imgs = imgs.type(z.dtype)
-        crops_pred = self.spatial_transformer(z[:, 0:3], imgs)
+        z_proj = self.posterior_to_st(z)
+        crops_pred = self.spatial_transformer(z_proj, imgs)
         nan_check_and_break(crops_pred, "predicted_crops_t")
         return {
             'crops_pred': crops_pred
@@ -235,10 +253,6 @@ class Saccader(nn.Module):
     def _z_to_image(self, z, imgs):
         ''' accepts images (or lambdas to crop) and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
-        if self.config['reparam_type'] == 'discrete':
-            raise NotImplementedError
-
-        assert z.size()[-1] >= 3, "z needs to be at least [scale, x, y]"
         assert len(imgs) == z.shape[0], "batch sizes for crop preds vs imgs dont match"
         crop_fn_map = {
             'transformer': self._z_to_image_transformer,
@@ -279,9 +293,11 @@ class Saccader(nn.Module):
 
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
-                z_t, params_t = self.vae.posterior(x_related)
+                x_related_inference = add_noise_to_imgs(x_related) \
+                    if self.config['add_img_noise'] else x_related
+                z_t, params_t = self.vae.posterior(x_related_inference)
 
-                nan_check_and_break(x_related, "x_related")
+                nan_check_and_break(x_related_inference, "x_related_inference")
                 nan_check_and_break(z_t['prior'], "prior")
                 nan_check_and_break(z_t['posterior'], "posterior")
                 nan_check_and_break(z_t['x_features'], "x_features")
@@ -291,7 +307,8 @@ class Saccader(nn.Module):
 
                 # do preds and sum
                 state = torch.mean(self.vae.memory.get_state()[0], 0)
-                crops_pred_perturbed = add_noise_to_imgs(x_trunc_t['crops_pred']) # add noise
+                crops_pred_perturbed = add_noise_to_imgs(x_trunc_t['crops_pred']) \
+                    if self.config['add_img_noise'] else x_trunc_t['crops_pred']
                 state_proj = self.latent_projector(crops_pred_perturbed, state)
                 x_preds = x_preds + state_proj[:, 0:-1] # last bit is for ACT
 
