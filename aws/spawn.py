@@ -6,8 +6,7 @@ import argparse
 import paramiko
 import numpy as np
 
-from fabric import Connection
-
+from joblib import Parallel, delayed
 
 parser = argparse.ArgumentParser(description='AWS Spawner')
 
@@ -101,11 +100,41 @@ def instances_to_ips(instance_list):
             total_waited_time += 1
 
     # XXX: add an extra sleep here to get ssh up
-    time.sleep(60)
+    time.sleep(40)
     print("{} instances successfully in running state.".format(len(instance_list)))
 
     reservations = client.describe_instances(InstanceIds=instance_list)['Reservations'][0]
     return [instance['PublicIpAddress'] for instance in reservations['Instances']]
+
+def get_launch_spec(args, custom_zone=None):
+    # custom creation of storage dict
+    storage_dict = {
+        'DeviceName': '/dev/sda1',
+        'Ebs':{
+            'DeleteOnTermination': True,
+            'VolumeType': 'gp2',
+            'VolumeSize': args.storage_size
+        }
+    }
+
+    # create the launch spec dict
+    launch_spec_dict = {
+        'SecurityGroups': [args.security_group],
+        'ImageId': args.ami,
+        'KeyName': args.keypair,
+        'InstanceType': args.instance_type,
+        'BlockDeviceMappings': [storage_dict],
+        'IamInstanceProfile': {
+            'Name': args.s3_iam
+        }
+    }
+
+    if custom_zone is not None:
+        launch_spec_dict['Placement'] = {
+            'AvailabilityZone': custom_zone
+        }
+
+    return launch_spec_dict
 
 
 def create_spot(args):
@@ -115,30 +144,8 @@ def create_spot(args):
         max_price = cheapest_price * args.upper_bound_spot_multiplier
         print("setting max price to {}".format(max_price))
 
-        # custom creation of storage dict
-        storage_dict = {
-            'DeviceName': '/dev/sda1',
-            'Ebs':{
-                'DeleteOnTermination': True,
-                'VolumeType': 'gp2',
-                'VolumeSize': args.storage_size
-            }
-        }
-
-        # create the launch spec dict
-        launch_spec_dict = {
-            'SecurityGroups': [args.security_group],
-            'ImageId': args.ami,
-            'KeyName': args.keypair,
-            'InstanceType': args.instance_type,
-            'Placement': {
-                'AvailabilityZone': cheapest_zone if args.instance_zone is None else args.instance_zone,
-            },
-            'BlockDeviceMappings': [storage_dict],
-            'IamInstanceProfile': {
-                'Name': args.s3_iam
-            }
-        }
+        zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
+        launch_spec_dict = get_launch_spec(args, zone_override)
 
         # request the node(s)
         instance_request = client.request_spot_instances(
@@ -148,7 +155,7 @@ def create_spot(args):
             InstanceCount=args.number_of_instances,
             LaunchSpecification=launch_spec_dict
         )
-        time.sleep(5) # XXX: sometimes remote doesn't update fast enough
+        time.sleep(10) # XXX: sometimes remote doesn't update fast enough
         #print("\ninstance_request = {}\n".format(instance_request))
 
         # return the requested instances
@@ -194,22 +201,20 @@ def create_spot(args):
 
 
 def create_ondemand(args):
-    raise NotImplementedError("on-demand not-yet implemented")
     try:
         ec2 = boto3.resource('ec2', region_name=args.instance_zone)
-        subnet = ec2.Subnet(args.subnet) if args.subnet is not None else ec2.Subnet()
-        instances = subnet.create_instances(
-            ImageId=args.ami,
-            InstanceType=args.instance_type,
+        #subnet = ec2.Subnet(args.subnet) if args.subnet is not None else ec2.Subnet()
+        instances = ec2.create_instances(
             MaxCount=args.number_of_instances,
             MinCount=args.number_of_instances,
-            KeyName=args.keypair,
-            SecurityGroups=[args.security_group]
+            **get_launch_spec(args)
         )
 
-        # return the requested instances
-        print(instances)
-        return instances
+        # XXX: allow server to get push request
+        time.sleep(10)
+
+        # return the requested instances ip addresses
+        return instances_to_ips([i.id for i in instances])
 
     except BaseException as exe:
         print(exe)
@@ -282,11 +287,7 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     }
 
 
-if __name__ == "__main__":
-    # print the config and sanity check
-    pprint.PrettyPrinter(indent=4).pprint(vars(args))
-    assert args.cmd is not None, "need to specify a command"
-
+def main(args):
     # execute the config
     if args.upper_bound_spot_multiplier > 0:
         print("attempted to request spot instance w/max price = {} x cheapest".format(
@@ -306,3 +307,12 @@ if __name__ == "__main__":
                               terminate_on_completion=not args.no_terminate)
         print("[{}][stdout]: {}".format(instance_ip, cli_out['stdout']))
         print("[{}][stderr]: {}".format(instance_ip, cli_out['stderr']))
+
+if __name__ == "__main__":
+    # print the config and sanity check
+    pprint.PrettyPrinter(indent=4).pprint(vars(args))
+    assert args.cmd is not None, "need to specify a command"
+
+    # parallelize the job create due to required sleep commands
+    Parallel(n_jobs=args.number_of_instances)(
+        delayed(main)(args) for i in range(args.number_of_instances))

@@ -41,6 +41,8 @@ parser = argparse.ArgumentParser(description='Variational Saccading')
 # Task parameters
 parser.add_argument('--use-full-resolution', action='store_true', default=False,
                     help='use the full resolution image instead of the downsampled one (default: False)')
+parser.add_argument('--checkpoint', action='store_true', default=False,
+                    help='use checkpointing (default: False)')
 parser.add_argument('--uid', type=str, default="",
                     help="add a custom task-specific unique id; appended to name (default: None)")
 parser.add_argument('--task', type=str, default="crop_dual_imagefolder",
@@ -114,8 +116,10 @@ if args.cuda:
 # handle randomness / non-randomness
 if args.seed is not None:
     print("setting seed %d" % args.seed)
-    numpy.random.seed(args.seed)
-    torch.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed_all(args.seed)
 
 # import FP16 optimizer and module
 if args.half is True:
@@ -573,10 +577,6 @@ def get_model_and_loader():
         resizer = torchvision.transforms.Resize(size=(args.synthetic_upsample_size,
                                                       args.synthetic_upsample_size),
                                                 interpolation=2)
-        fivecrop1 = torchvision.transforms.FiveCrop(size=(896, 896))
-        fivecrop2 = torchvision.transforms.FiveCrop(size=(448, 448))
-        fivecrop3 = torchvision.transforms.FiveCrop(size=(224, 224))
-        #tencrop = torchvision.transforms.TenCrop(size=(224, 224))
 
         def extract_patches_2D(img, size):
             patch_H, patch_W = min(img.size(2),size[0]),min(img.size(3),size[1])
@@ -598,36 +598,21 @@ def get_model_and_loader():
 
             return patches
 
-        def _five_five_five_crops(crop):
-            # five_crops = fivecrop1(crop)
-            # all_crops = [fivecrop2(fc) for fc in five_crops]
-            # all_crops = [item for sublist in all_crops for item in sublist]
-            # all_crops = [fivecrop3(fc) for fc in all_crops]
-            # return [item for sublist in all_crops for item in sublist]
-            #print('shp = ', resizer(crop).transpose(0, 2).numpy().shape)
-
+        def patch_extractor_lambda(crop):
             crop = crop.unsqueeze(0) if len(crop.shape) < 4 else crop
             return extract_patches_2D(crop, [224, 224])
 
-        # combiner = torchvision.transforms.Lambda(
-        #     lambda crops: torch.stack([to_tensor(crop) for crop in crops])
-        # )
+        aux_transform = lambda x: patch_extractor_lambda(
+            to_tensor(resizer(to_pil(to_tensor(x)))))
 
-        # now build the transform
-        # aux_transform = lambda x: combiner(_five_five_five_crops(
-        #     to_tensor(resizer(to_pil(to_tensor(x))))
-        #     #to_pil(to_tensor(x))
-        # ))
-        aux_transform = lambda x: _five_five_five_crops(to_tensor(resizer(to_pil(to_tensor(x)))))
-
-    loader = get_loader(args, transform=None,#[aux_transform],
+    loader = get_loader(args, transform=None,
                         sequentially_merge_test=False,
                         aux_transform=aux_transform,
                         postfix="_large", **vars(args))
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
-    model = MultiBatchModule(loader.output_size)
+    model = MultiBatchModule(loader.output_size, checkpoint=args.checkpoint)
 
     # FP16-ize, cuda-ize and parallelize (if requested)
     model = model.half() if args.half is True else model
@@ -649,17 +634,18 @@ def get_model_and_loader():
 
 
 class MultiBatchModule(nn.Module):
-    def __init__(self, output_size, latent_size=256):
+    def __init__(self, output_size, latent_size=256, checkpoint=True):
         super(MultiBatchModule, self).__init__()
         self.output_size = output_size
         self.latent_size = latent_size
+        self.checkpoint = checkpoint
         self.model, self.proj = self.get_model()
 
     def forward(self, x, step=11):
         logits = zeros((x.size(0), self.latent_size),
                        cuda=args.cuda, dtype=get_dtype(x)).requires_grad_()
-        #print("x = ", x.shape)
-        if len(x.shape) == 5:
+        x = x.requires_grad_()
+        if len(x.shape) == 5 and self.checkpoint:
             assert (x.shape[1] - 1) % step == 0, "crops{} need to be div by {}".format(
                 x.shape[1], step
             )
@@ -667,7 +653,6 @@ class MultiBatchModule(nn.Module):
             def _run_k(*args):
                 x, begin, end, logits = args[0], args[1], args[2], args[3]
                 for i in range(begin.item(), end.item()):
-                    #print("i = ", i)
                     logits = logits + self.model(
                         x[:, i, :, :, :].cuda().requires_grad_()
                     )
@@ -682,15 +667,17 @@ class MultiBatchModule(nn.Module):
                 logits = checkpoint(_run_k, x, torch.Tensor([begin]).type(torch.int32),
                                     torch.Tensor([end]).type(torch.int32), logits)
 
-            # for i in range(0, x.size(1) - 1):
-            #     x_single = x[:, i, :, :, :].cuda()
-            #     logits = logits + self.model(x_single)
-            #     del x_single
-
             # run last one outside checkpointing
             x_single = x[:, -1, :, :, :].cuda().requires_grad_()
             logits = logits + self.model(x_single)
         else:
+            # if x.shape == 5:
+            #     # this is the setting where we are using multi-gpu
+            #     # i.e. the naive setting
+            #     x = x.view(-1, *x.shape[-3:])
+
+            print("here! x = ", x.shape)
+            exit(0)
             logits = self.model(x.cuda())
 
         return self.proj(logits)
@@ -733,95 +720,6 @@ class MultiBatchModule(nn.Module):
             nn.Linear(self.latent_size, self.output_size)
         )
         return model, proj
-
-# class MultiBatchModule(nn.Module):
-#     def __init__(self, output_size, latent_size=10):
-#         super(MultiBatchModule, self).__init__()
-#         self.output_size = output_size
-#         self.latent_size = latent_size
-#         self.model, self.proj = self.get_model()
-
-#     def forward(self, x, step=11):
-#         assert len(x.shape) == 5
-#         feature_size = self.latent_size*x.size(1)
-#         logits = zeros((x.size(0), feature_size),
-#                        cuda=args.cuda, dtype=get_dtype(x)).requires_grad_()
-#         #print("x = ", x.shape)
-#         assert (x.shape[1] - 1) % step == 0, "crops{} need to be div by {}".format(
-#             x.shape[1], step
-#         )
-
-#         def _run_k(*args):
-#             x, begin, end, logits = args[0], args[1], args[2], args[3]
-#             for i in range(begin.item(), end.item()):
-#                 #print("i = ", i)
-#                 logits[:, i*self.latent_size:(i*self.latent_size) + self.latent_size] = self.model(x[:, i, :, :, :].cuda())
-#                 #print(i*self.latent_size, (i*self.latent_size)+self.latent_size)
-#                 #logits = logits + self.model(x[:, i, :, :, :].cuda())
-
-#             return logits
-
-#         # need to run last separately as per pytorch repo
-#         # let the +1-1 intentionally for understanding
-#         for begin, end in zip(range(0, x.size(1)-1, step),
-#                               range(step, x.size(1)+1-1, step)):
-#             #print("begin = ", begin, " | end = ", end)
-#             logits = checkpoint(_run_k, x, torch.Tensor([begin]).type(torch.int32),
-#                                 torch.Tensor([end]).type(torch.int32), logits)
-
-#         # for i in range(0, x.size(1) - 1):
-#         #     x_single = x[:, i, :, :, :].cuda()
-#         #     logits = logits + self.model(x_single)
-#         #     del x_single
-
-#         # run last one outside checkpointing
-#         x_single = x[:, -1, :, :, :].cuda()
-#         #print((x.size(1)-1)*self.latent_size, ((x.size(1)-1)*self.latent_size)+self.latent_size)
-#         logits[:, (x.size(1)-1)*self.latent_size:((x.size(1)-1)*self.latent_size)+self.latent_size] \
-#             = self.model(x_single)
-
-#         # proj through DNN
-#         return self.proj(logits)
-
-#     def get_model(self):
-#         model_map = {
-#             'vgg16_bn': vgg16_bn,
-#             'resnet18': resnet18,
-#             'resnet34': resnet34,
-#             'resnet50': resnet50,
-#             'resnet101': resnet101,
-#             'resnet152': resnet152,
-#             'resnet18_dropout': resnet18_dropout,
-#             'resnet34_dropout': resnet34_dropout,
-#             'resnet50_dropout': resnet50_dropout,
-#             'resnet101_dropout': resnet101_dropout,
-#             'resnet152_dropout': resnet152_dropout
-#         }
-
-#         print("using {} baseline model on {}-{} with batch-size {}".format(
-#             args.baseline,
-#             args.task,
-#             "full" if args.use_full_resolution else "truncated",
-#             args.batch_size
-#         ))
-
-#         model = nn.Sequential(
-#             BWtoRGB(),
-#             nn.Upsample(size=[224, 224], mode='bilinear', align_corners=True),
-#             model_map[args.baseline](num_classes=self.latent_size)
-#         )
-
-#         # takes the output of the sum of logits and projects to output
-#         feature_size = self.latent_size * 144
-#         proj = nn.Sequential(
-#             nn.BatchNorm1d(feature_size),
-#             nn.ReLU(),
-#             nn.Linear(feature_size, 128),
-#             nn.BatchNorm1d(128),
-#             nn.ReLU(),
-#             nn.Linear(128, self.output_size)
-#         )
-#         return model, proj
 
 
 
