@@ -16,11 +16,15 @@ from torch.autograd import Variable
 
 
 from models.vae.vrnn import VRNN
+from model.vae.vrnn import VRNNReinforce
+
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 from helpers.layers import EarlyStopping, Rotate, init_weights
 from models.pool import train_model_pool
 from models.saccade import Saccader
+from models.saccade import SaccaderReinforce
+
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
 from datasets.utils import normalize_images
 from optimizers.adamnormgrad import AdamNormGrad
@@ -104,6 +108,10 @@ parser.add_argument('--use-noisy-rnn-state', action='store_true',
 parser.add_argument('--max-time-steps', type=int, default=4,
                     help='max time steps for RNN (default: 4)')
 
+# (REINFORCE) loss related
+parser.add_argument('--use-reinforce', action='store_true',
+                    help='Use hard crops and REINFORCE loss (default: False)')
+
 # Regularizer related
 parser.add_argument('--continuous-mut-info', type=float, default=0,
                     help='-continuous_mut_info * I(z_c; x) is applied (opposite dir of disc)(default: 0.0)')
@@ -186,10 +194,10 @@ def build_optimizer(model):
         "adamw": AdamW,
         "adadelta": optim.Adadelta,
         "sgd": optim.SGD,
-        "sgd_momentum": lambda params, lr : optim.SGD(params,
-                                                      lr=lr,
-                                                      weight_decay=1e-4,
-                                                      momentum=0.9),
+        "sgd_momentum": lambda params, lr: optim.SGD(params,
+                                                     lr=lr,
+                                                     weight_decay=1e-4,
+                                                     momentum=0.9),
         "lbfgs": optim.LBFGS
     }
     # filt = filter(lambda p: p.requires_grad, model.parameters())
@@ -227,13 +235,13 @@ def register_images(output_map, grapher, prefix='train'):
         if 'img' in k or 'imgs' in k:
             key_name = '-'.join(k.split('_')[0:-1])
             grapher.add_image('{}_{}'.format(prefix, key_name),
-                              v.detach(), global_step=0) # dont use step
+                              v.detach(), global_step=0)  # dont use step
 
 
 def _add_loss_map(loss_tm1, loss_t):
     ''' helper to add two maps and keep counts
         of the total samples for reduction later'''
-    if not loss_tm1: # base case: empty dict
+    if not loss_tm1:  # base case: empty dict
         resultant = {'count': 1}
         for k, v in loss_t.items():
             if 'mean' in k or 'scalar' in k:
@@ -242,7 +250,6 @@ def _add_loss_map(loss_tm1, loss_t):
                 else:
                     resultant[k] = v
 
-
         return resultant
 
     resultant = {}
@@ -250,7 +257,8 @@ def _add_loss_map(loss_tm1, loss_t):
         if 'mean' in k or 'scalar' in k:
             if isinstance(v, torch.Tensor):
                 resultant[k] = loss_tm1[k] + v.clone().detach()
-            else:                resultant[k] = loss_tm1[k] + v
+            else:
+                resultant[k] = loss_tm1[k] + v
 
     # increment total count
     resultant['count'] = loss_tm1['count'] + 1
@@ -268,6 +276,7 @@ def _mean_map(loss_map):
 # create this once
 rotator = Rotate(args.synthetic_rotation)
 
+
 def generate_related(data, x_original, args):
     # handle logic for crop-image-loader & multi-image-folder
     if x_original is not None:
@@ -279,8 +288,8 @@ def generate_related(data, x_original, args):
     ds_img_size = tuple(int(i) for i in np.asarray(original_img_size)
                         // args.downsample_scale)  # eg: [12, 12]
     x_downsampled = F.interpolate(
-        F.interpolate(data, ds_img_size, mode='bilinear',  align_corners=True), # blur the crap out
-        original_img_size, mode='bilinear', align_corners=True) # of the original data
+        F.interpolate(data, ds_img_size, mode='bilinear', align_corners=True),  # blur the crap out
+        original_img_size, mode='bilinear', align_corners=True)  # of the original data
     x_upsampled = F.interpolate(data, (args.synthetic_upsample_size,
                                        args.synthetic_upsample_size),
                                 mode='bilinear', align_corners=True)
@@ -370,7 +379,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
             optimizer.step()
             del loss_t
 
-    loss_map = _mean_map(loss_map) # reduce the map to get actual means
+    loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean']
 
     print('{}[Epoch {}][{} samples][{:.2f} sec]:\
@@ -409,9 +418,14 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     # delete the data instances, see https://tinyurl.com/ycjre67m
     loss_map.clear(), input_imgs_map.clear(), imgs_map.clear()
     output_map.clear(), reparam_scalars.clear()
-    del loss_map; del input_imgs_map; del imgs_map
-    del output_map; del reparam_scalars
-    del x_related; del x_original; del labels
+    del loss_map
+    del input_imgs_map
+    del imgs_map
+    del output_map
+    del reparam_scalars
+    del x_related
+    del x_original
+    del labels
     gc.collect()
 
     # return loss scalar map
@@ -426,20 +440,20 @@ def train(epoch, model, optimizer, loader, grapher, prefix='train'):
 
 
 def test(epoch, model, loader, grapher, prefix='test'):
-     ''' test loop helper '''
-     return execute_graph(epoch, model, loader,
-                          grapher, prefix='test',
-                          plot_mem=False)
+    ''' test loop helper '''
+    return execute_graph(epoch, model, loader,
+                         grapher, prefix='test',
+                         plot_mem=False)
 
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     aux_transform = None
     if args.synthetic_upsample_size > 0 and args.task == "multi_image_folder":
-        aux_transform = lambda x: F.interpolate(torchvision.transforms.ToTensor()(x).unsqueeze(0),
-                                                size=(args.synthetic_upsample_size,
-                                                      args.synthetic_upsample_size),
-                                                mode='bilinear', align_corners=True).squeeze(0)
+        def aux_transform(x): return F.interpolate(torchvision.transforms.ToTensor()(x).unsqueeze(0),
+                                                   size=(args.synthetic_upsample_size,
+                                                         args.synthetic_upsample_size),
+                                                   mode='bilinear', align_corners=True).squeeze(0)
 
     loader = get_loader(args, transform=None,
                         sequentially_merge_test=False,
@@ -448,15 +462,26 @@ def get_model_and_loader():
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
-    vae = VRNN(loader.img_shp,
-               n_layers=2,            # XXX: hard coded
-               #bidirectional=True,    # XXX: hard coded
-               bidirectional=False,    # XXX: hard coded
-               kwargs=vars(args))
+    if self.config['use-reinforce']:
+        vae = VRNNReinforce(loader.img_shp,
+                            n_layers=2,            # XXX: hard coded
+                            # bidirectional=True,    # XXX: hard coded
+                            bidirectional=False,    # XXX: hard coded
+                            kwargs=vars(args))
+    else:
+        vae = VRNN(loader.img_shp,
+                   n_layers=2,            # XXX: hard coded
+                   # bidirectional=True,    # XXX: hard coded
+                   bidirectional=False,    # XXX: hard coded
+                   kwargs=vars(args))
 
     # build the Variational Saccading module
     # and lazy generate the non-constructed modules
-    saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
+    if self.config['use-reinforce']:
+        saccader = SaccaderReinforce(vae, loader.output_size, kwargs=vars(args))
+    else:
+        saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
+
     lazy_generate_modules(saccader, loader.train_loader)
 
     # FP16-ize, cuda-ize and parallelize (if requested)
@@ -483,14 +508,15 @@ def get_model_and_loader():
 def lazy_generate_modules(model, loader):
     ''' Super hax, but needed for building lazy modules '''
     model.eval()
-    model.config['half'] = False # disable half here due to CPU weights
+    model.config['half'] = False  # disable half here due to CPU weights
     for item in loader:
         # first destructure the data and cuda-ize and wrap in vars
         x_original, x_related, _ = _unpack_data_and_labels(item)
         x_original, x_related = generate_related(x_related, x_original, args)
         with torch.no_grad():
             _ = model(x_original, x_related)
-            del x_original; del x_related
+            del x_original
+            del x_related
             gc.collect()
             break
 
@@ -514,7 +540,7 @@ def generate(epoch, model, grapher, generate_every=10):
             time.time() - start_time)
         )
 
-        gen_map = {} # generate and place in map
+        gen_map = {}  # generate and place in map
         for i, sample in enumerate(samples):
             gen_map['samples{}_imgs'.format(i)] \
                 = F.interpolate(sample, (32, 32), mode='bilinear', align_corners=True)
@@ -523,12 +549,13 @@ def generate(epoch, model, grapher, generate_every=10):
 
         # XXX: memory cleanups
         gen_map.clear()
-        del samples; gc.collect()
+        del samples
+        gc.collect()
 
 
 def scalar_map_to_csvs(scalar_map, prefix='test'):
     ''' iterates over map and writes all items with _mean or _scalar fields to csv'''
-    for k,v in scalar_map.items():
+    for k, v in scalar_map.items():
         if 'mean' in k or 'scalar' in k:
             append_to_csv([v], "{}_{}_{}.csv".format(args.uid, prefix, k))
 
@@ -553,7 +580,7 @@ def run(args):
             test_map = test(epoch, model, loader.test_loader, grapher)
 
             if args.early_stop and early(test_map['pred_loss_mean']):
-                early.restore() # restore and test again
+                early.restore()  # restore and test again
                 test_map = test(epoch, model, loader.test_loader, grapher)
                 break
 
@@ -561,7 +588,7 @@ def run(args):
             if args.optimizer == 'sgd_momentum':
                 decay_lr_every(optimizer, args.lr, epoch)
 
-        grapher.save() # save to endpoint after training
+        grapher.save()  # save to endpoint after training
     else:
         assert model.load(args.restore), "Failed to load model"
         test_loss, test_acc = test(epoch, model, loader.test_loader, grapher)

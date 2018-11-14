@@ -258,7 +258,6 @@ class Saccader(nn.Module):
         crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
         return crop_fn_map[crop_type](z, imgs)
 
-
     def generate(self, batch_size):
         self.eval()
         samples = []
