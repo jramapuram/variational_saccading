@@ -11,6 +11,8 @@ from joblib import Parallel, delayed
 parser = argparse.ArgumentParser(description='AWS Spawner')
 
 # Node config
+parser.add_argument('--uid', type=str, default=None,
+                    help="tag for instance(s) (default: None)")
 parser.add_argument('--instance-type', type=str, default="p3.2xlarge",
                     help="instance type (default: p3.2xlarge)")
 parser.add_argument('--number-of-instances', type=int, default=1,
@@ -72,6 +74,11 @@ def get_cheapest_price(args):
     print("found cheapest price of {}$ in zone {}".format(cheapest_price, cheapest_zone))
     return cheapest_price, cheapest_zone
 
+def attach_tag(instance_list, tag=None):
+    if tag is not None:
+        client = boto3.client('ec2', region_name=args.instance_region)
+        client.create_tags(Resources=instance_list,
+                           Tags=[{'Key':'name', 'Value':tag}])
 
 def instances_to_ips(instance_list):
     assert isinstance(instance_list, list), "need a list as input"
@@ -194,6 +201,7 @@ def create_spot(args):
                     print("successfully created {} instances".format(len(instances)))
                     all_instances_created = True
 
+        attach_tag(instances, tag=args.uid)
         return instances_to_ips(instances)
 
     except BaseException as exe:
@@ -214,7 +222,9 @@ def create_ondemand(args):
         time.sleep(10)
 
         # return the requested instances ip addresses
-        return instances_to_ips([i.id for i in instances])
+        instance_ids = [i.id for i in instances]
+        attach_tag(instance_ids, tag=args.uid)
+        return instances_to_ips(instance_ids)
 
     except BaseException as exe:
         print(exe)
@@ -245,6 +255,7 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     )
 
     # build the final command to send over ssh
+    orig_cmd = cmd # cache for use in file transfer
     cmd = "{} ; tmux new-session -d -s runtime; \
     tmux send-keys \"{} > ~/setup.log ; sh /tmp/{} > ~/cmd.log ; {} ; {} \" C-m ; \
     tmux detach -s runtime".format(
@@ -255,7 +266,10 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     client.connect(hostname=hostname, username=username, pkey=key)
 
     # send all files from current directory to remote server
-    for local_file in os.listdir("."):
+    all_files = [local_file for local_file in os.listdir(".")
+                 if local_file == 'setup.sh' or local_file == orig_cmd]
+    print("transferring {} to host {}".format(all_files, hostname))
+    for local_file in all_files:
         remote_file = os.path.join("/tmp", os.path.basename(local_file))
         put_file(client, local_file, remote_file)
 
