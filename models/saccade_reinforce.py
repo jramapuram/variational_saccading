@@ -103,6 +103,10 @@ class SaccaderReinforce(Saccader):
 
                 # Keep locations and baselines per time-step
 
+                nan_check_and_break(l_t, "l_t")
+                nan_check_and_break(p, "p")
+                nan_check_and_break(base_score.squeeze(), "base_score")
+
                 locs.append(l_t)
                 log_pi.append(p)
                 baselines.append(base_score.squeeze())
@@ -164,11 +168,13 @@ class SaccaderReinforce(Saccader):
         batch_size = x.shape[0]
 
         log_probas = output_map['preds']
-
         predicted = torch.max(log_probas, 1)[1]
 
         # Losses for differential modules
         locations = output_map['location']
+
+        nan_check_and_break(locations, "locations")
+        nan_check_and_break(log_probas, "log_probas")
 
         log_pi = zeros((batch_size, ), x.is_cuda)
         baselines = zeros((batch_size, ), x.is_cuda)
