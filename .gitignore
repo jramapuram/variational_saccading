@@ -3,8 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# tensorboard
+runs/
+
 # C extensions
 *.so
+
+# vscode
+.vscode/
 
 # Distribution / packaging
 .Python

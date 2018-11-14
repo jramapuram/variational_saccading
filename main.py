@@ -16,14 +16,15 @@ from torch.autograd import Variable
 
 
 from models.vae.vrnn import VRNN
-from model.vae.vrnn import VRNNReinforce
+from models.vae.vrnn_reinforce import VRNNReinforce
 
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 from helpers.layers import EarlyStopping, Rotate, init_weights
 from models.pool import train_model_pool
+
 from models.saccade import Saccader
-from models.saccade import SaccaderReinforce
+from models.saccade_reinforce import SaccaderReinforce
 
 from datasets.loader import get_split_data_loaders, get_loader, simple_merger, sequential_test_set_merger
 from datasets.utils import normalize_images
@@ -81,7 +82,7 @@ parser.add_argument('--add-img-noise', action='store_true',
                     help='add scattered noise to  images (default: False)')
 parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
-parser.add_argument('--reparam-type', type=str, default='beta',
+parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
                     help='isotropic_gaussian / discrete / beta / mixture / beta_mixture (default: beta)')
 parser.add_argument('--encoder-layer-type', type=str, default='conv',
                     help='dense or conv (default: conv)')
@@ -111,6 +112,7 @@ parser.add_argument('--max-time-steps', type=int, default=4,
 # (REINFORCE) loss related
 parser.add_argument('--use-reinforce', action='store_true',
                     help='Use hard crops and REINFORCE loss (default: False)')
+parser.add_argument('--std', type=int, default=0.17, help='standard deviation for locator sampler (default: 0.17)')
 
 # Regularizer related
 parser.add_argument('--continuous-mut-info', type=float, default=0,
@@ -462,7 +464,7 @@ def get_model_and_loader():
 
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp
-    if self.config['use-reinforce']:
+    if args.use_reinforce:
         vae = VRNNReinforce(loader.img_shp,
                             n_layers=2,            # XXX: hard coded
                             # bidirectional=True,    # XXX: hard coded
@@ -477,7 +479,7 @@ def get_model_and_loader():
 
     # build the Variational Saccading module
     # and lazy generate the non-constructed modules
-    if self.config['use-reinforce']:
+    if args.use_reinforce:
         saccader = SaccaderReinforce(vae, loader.output_size, kwargs=vars(args))
     else:
         saccader = Saccader(vae, loader.output_size, kwargs=vars(args))
