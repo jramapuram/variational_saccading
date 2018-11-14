@@ -16,7 +16,7 @@ from .numerical_diff_module import NumericalDifferentiator
 from .spatial_transformer import SpatialTransformer
 from datasets.crop_dual_imagefolder import CropLambdaPool, USE_LIB
 
-from saccade import Saccader
+from .saccade import Saccader
 
 
 class SaccaderReinforce(Saccader):
@@ -57,9 +57,9 @@ class SaccaderReinforce(Saccader):
                 # check locator function
                 # check std param
                 # locator forward
-                mu, l_t = self.vae.locator()
+                mu, l_t = self.vae.get_locator()
 
-                p = D.Normal(mu, self.std).log_prob(l_t)
+                p = D.Normal(mu, self.config['std']).log_prob(l_t)
                 p = torch.sum(p, dim=1)
 
                 # foveate / cropper code here
@@ -71,7 +71,7 @@ class SaccaderReinforce(Saccader):
 
                 # hard cropper
                 # x_trunc_t = self._z_to_image(z_t['posterior'], x)
-                x_trunc_t = self._hard_crop(self, x, l_t, self.config['window_size'])
+                x_trunc_t = self._hard_crop(x, l_t, self.config['window_size'])
 
                 # call forward baseline here
                 base_score = self.vae.get_baseline()
@@ -88,13 +88,13 @@ class SaccaderReinforce(Saccader):
                 x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
 
                 # decode the posterior
-                decoded_t = self.vae.decode(z_t, produce_output=True)
-                nan_check_and_break(decoded_t, "decoded_t")
+                # decoded_t = self.vae.decode(z_t, produce_output=True)
+                # nan_check_and_break(decoded_t, "decoded_t")
 
                 # cache for loss function & visualization
                 params.append(params_t)
                 crops.append(x_trunc_t)
-                decodes.append(decoded_t)
+                # decodes.append(decoded_t)
 
                 # conditionally break away based on ACT
                 # act = act + torch.sigmoid(state_proj[:, -1])
@@ -105,7 +105,7 @@ class SaccaderReinforce(Saccader):
 
                 locs.append(l_t)
                 log_pi.append(p)
-                baselines.append(base_score)
+                baselines.append(base_score.squeeze())
 
             # After last time step
             preds = self.latent_projector.get_output(
@@ -118,11 +118,10 @@ class SaccaderReinforce(Saccader):
                 'baselines': baselines,
                 'act': act / max(i, 1),
                 'saccades_scalar': i,
-                'decoded': decodes,
+                # 'decoded': decodes,
                 'params': params,
                 'preds': preds,
-                'crops': x_trunc_t,
-                'crops_true': crops_true
+                'crops': x_trunc_t
             }
 
         # forward pass with decoding [normal]
@@ -149,20 +148,6 @@ class SaccaderReinforce(Saccader):
     # Reinforce loss
     def loss_function(self, x, labels, output_map):
 
-        # build and call module here
-        # build custom module
-
-        # Predicted class
-        loss_fn = F.binary_cross_entropy_with_logits \
-            if len(labels.shape) > 1 else F.cross_entropy
-        pred_loss = loss_fn(
-            input=output_map['preds'],
-            target=labels,
-            reduction='none'
-        )
-
-        pred_loss = torch.sum(pred_loss, -1) if len(pred_loss.shape) > 1 else pred_loss
-
         # Need
         # 1)
         # soft predictions, log_probas
@@ -175,28 +160,50 @@ class SaccaderReinforce(Saccader):
         # Hard class prediction
         # 4) baselines
 
+        n_sacc = self.config['max_time_steps']
+        batch_size = x.shape[0]
+
         log_probas = output_map['preds']
+
         predicted = torch.max(log_probas, 1)[1]
 
-        log_pi = output_map['log_pi']
-        log_pi = torch.stack(log_pi).transpose(1, 0)
+        # Losses for differential modules
+        locations = output_map['location']
 
-        baselines = torch.stack(baselines).transpose(1, 0)
+        log_pi = zeros((batch_size, ), x.is_cuda)
+        baselines = zeros((batch_size, ), x.is_cuda)
+        loss_actions = zeros((batch_size, ), x.is_cuda)
+
+        for i in range(n_sacc):
+            log_pi += output_map['log_pi'][i]
+            baselines += output_map['baselines'][i]
+            mu = output_map['params'][i]['posterior']['gaussian']['mu']
+            log_var = output_map['params'][i]['posterior']['gaussian']['logvar']
+            loss_actions[i] += torch.sum(D.Normal(mu, log_var).log_prob(locations[i]))
+
+        log_pi /= n_sacc
+        baselines /= n_sacc
+        loss_actions /= n_sacc
 
         # Calculate reward, needs possible unroll
         R = (predicted.detach() == labels).float()
 
-        # Losses for differential modules
-        loss_actions = vae_loss_map['nll_mean']
         # Baseline compensation
         loss_baseline = F.mse_loss(baselines, R)
 
         # Compute reinforce loss, sum over time-steps and average the batch
         adjusted_reward = R - baselines.detach()
-        loss_reinforce = torch.sum(-log_pi * adjusted_reward, dim=1)
-        loss_reinforce = torch.mean(loss_reinforce, dim=0)
+        loss_reinforce = -log_pi * adjusted_reward
 
-        return loss_reinforce
+        loss = torch.mean(loss_actions + loss_baseline + loss_reinforce)
+
+        loss_map = {}
+        loss_map['actions_mean'] = loss_actions
+        loss_map['baselines_mean'] = loss_baseline
+        loss_map['reinforce_mean'] = loss_reinforce
+        loss_map['loss_mean'] = loss
+
+        return loss_map
 
     def _hard_crop(self, x, l, size):
         """
@@ -241,7 +248,7 @@ class SaccaderReinforce(Saccader):
             from_y, to_y = from_y.item(), to_y.item()
 
             # pad tensor in case exceeds
-            if self.exceeds(from_x, to_x, from_y, to_y, T):
+            if self._exceeds(from_x, to_x, from_y, to_y, T):
                 pad_dims = (
                     size // 2 + 1, size // 2 + 1,
                     size // 2 + 1, size // 2 + 1,
