@@ -384,13 +384,18 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean']
 
+    # print('{}[Epoch {}][{} samples][{:.2f} sec]:\
+    # Average loss: {:.4f}\tKLD: {:.4f}\t\
+    # NLL: {:.4f}\tAcc: {:.4f}'.format(
+    #     prefix, epoch, num_samples, time.time() - start_time,
+    #     loss_map['loss_mean'].item(),
+    #     loss_map['kld_mean'].item(),
+    #     loss_map['nll_mean'].item(),
+    #     correct_percent))
     print('{}[Epoch {}][{} samples][{:.2f} sec]:\
-    Average loss: {:.4f}\tKLD: {:.4f}\t\
-    NLL: {:.4f}\tAcc: {:.4f}'.format(
+    Average loss: {:.4f}\tAcc: {:.4f}'.format(
         prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
-        loss_map['kld_mean'].item(),
-        loss_map['nll_mean'].item(),
         correct_percent))
 
     # gather scalar values of reparameterizers (if they exist)
