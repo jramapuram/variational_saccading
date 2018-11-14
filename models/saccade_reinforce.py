@@ -178,12 +178,13 @@ class SaccaderReinforce(Saccader):
             log_pi += output_map['log_pi'][i]
             baselines += output_map['baselines'][i]
             mu = output_map['params'][i]['posterior']['gaussian']['mu']
-            log_var = output_map['params'][i]['posterior']['gaussian']['logvar']
+            log_var = torch.tanh(output_map['params'][i]['posterior']['gaussian']['logvar'])
             loss_actions[i] += torch.sum(D.Normal(mu, log_var).log_prob(locations[i]))
 
         log_pi /= n_sacc
         baselines /= n_sacc
         loss_actions /= n_sacc
+
 
         # Calculate reward, needs possible unroll
         R = (predicted.detach() == labels).float()
