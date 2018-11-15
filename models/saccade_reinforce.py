@@ -103,9 +103,10 @@ class SaccaderReinforce(Saccader):
 
                 # Keep locations and baselines per time-step
 
-                nan_check_and_break(l_t, "l_t")
-                nan_check_and_break(p, "p")
-                nan_check_and_break(base_score.squeeze(), "base_score")
+                # print types and check
+                # nan_check_and_break(l_t, "l_t")
+                # nan_check_and_break(p, "p")
+                # nan_check_and_break(base_score.squeeze(), "base_score")
 
                 locs.append(l_t)
                 log_pi.append(p)
@@ -115,6 +116,11 @@ class SaccaderReinforce(Saccader):
             preds = self.latent_projector.get_output(
                 x_preds / self.config['max_time_steps']
             )
+
+            # Make tensors
+            locs = torch.stack(locs)
+            log_pi = torch.stack(log_pi)
+            baselines = torch.stack(baselines)
 
             return {
                 'location': locs,
