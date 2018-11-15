@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros, get_dtype, \
-    plot_tensor_grid, add_noise_to_imgs
+    plot_tensor_grid, add_noise_to_imgs, zero_check_and_break
 from helpers.layers import View, Identity, get_encoder, str_to_activ_module
 from .image_state_projector import ImageStateProjector
 from .numerical_diff_module import NumericalDifferentiator
@@ -35,6 +35,9 @@ class SaccaderReinforce(Saccader):
             self.vae.memory.init_state(batch_size, cuda=x_related.is_cuda)
             self.vae.memory.init_output(batch_size, seqlen=1, cuda=x_related.is_cuda)
 
+            # reset the location
+            l_t = torch.Tensor(x.shape[0], 2).uniform_(-1, 1)
+
             # accumulator for predictions and ACT
             x_preds = zeros((batch_size, self.config['latent_size']),
                             cuda=x_related.is_cuda,
@@ -47,66 +50,46 @@ class SaccaderReinforce(Saccader):
             baselines = []
 
             for i in range(self.config['max_time_steps']):
+
                 # get posterior and params, expand 0'th dim for seqlen
                 x_related_inference = add_noise_to_imgs(x_related) \
                     if self.config['add_img_noise'] else x_related
 
-                z_t, params_t = self.vae.posterior(x_related_inference)
+                # hard cropper
+                # x_trunc_t = self._z_to_image(z_t['posterior'], x)
+                nan_check_and_break(l_t, "l_t")
+                x_trunc_t = self._hard_crop(x_related_inference, l_t, self.config['window_size'])
 
-                # TODO:
-                # check locator function
-                # check std param
-                # locator forward
+                nan_check_and_break(x_trunc_t, "x_trunc_t time step" + str(i))
+                # x_trunc_t = [64, 1, 32, 32]
+                # print('x_trunc_t size {}'.format(x_trunc_t.size()))
+
+                crops_pred_perturbed = add_noise_to_imgs(x_trunc_t) \
+                    if self.config['add_img_noise'] else x_trunc_t
+
+                state = torch.mean(self.vae.memory.get_state()[0], 0)
+                state_proj = self.latent_projector(crops_pred_perturbed, state)
+                x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
+
+                z_t, params_t = self.vae.posterior(x_trunc_t)
+
+                #  locator forward, based on hidden state
                 mu, l_t = self.vae.get_locator()
 
                 p = D.Normal(mu, self.config['std']).log_prob(l_t)
                 p = torch.sum(p, dim=1)
-
-                # foveate / cropper code here
 
                 nan_check_and_break(x_related_inference, "x_related_inference")
                 nan_check_and_break(z_t['prior'], "prior")
                 nan_check_and_break(z_t['posterior'], "posterior")
                 nan_check_and_break(z_t['x_features'], "x_features")
 
-                # hard cropper
-                # x_trunc_t = self._z_to_image(z_t['posterior'], x)
-                x_trunc_t = self._hard_crop(x, l_t, self.config['window_size'])
-
                 # call forward baseline here
                 base_score = self.vae.get_baseline()
-
-                # to modify
-                # do preds and sum
-
-                state = torch.mean(self.vae.memory.get_state()[0], 0)
-
-                crops_pred_perturbed = add_noise_to_imgs(x_trunc_t) \
-                    if self.config['add_img_noise'] else x_trunc_t
-
-                state_proj = self.latent_projector(crops_pred_perturbed, state)
-                x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
-
-                # decode the posterior
-                # decoded_t = self.vae.decode(z_t, produce_output=True)
-                # nan_check_and_break(decoded_t, "decoded_t")
 
                 # cache for loss function & visualization
                 params.append(params_t)
                 crops.append(x_trunc_t)
-                # decodes.append(decoded_t)
-
-                # conditionally break away based on ACT
-                # act = act + torch.sigmoid(state_proj[:, -1])
-                # if torch.max(act / max(i, 1)) >= 0.9998:
-                #     break
-
-                # Keep locations and baselines per time-step
-
-                # print types and check
-                # nan_check_and_break(l_t, "l_t")
-                # nan_check_and_break(p, "p")
-                # nan_check_and_break(base_score.squeeze(), "base_score")
 
                 locs.append(l_t)
                 log_pi.append(p)
@@ -182,21 +165,33 @@ class SaccaderReinforce(Saccader):
         nan_check_and_break(locations, "locations")
         nan_check_and_break(log_probas, "log_probas")
 
-        log_pi = zeros((batch_size, ), x.is_cuda)
-        baselines = zeros((batch_size, ), x.is_cuda)
-        loss_actions = zeros((batch_size, ), x.is_cuda)
+        # log_pi = zeros((batch_size, ), x.is_cuda)
+        # baselines = zeros((batch_size, ), x.is_cuda)
+        # loss_actions = zeros((batch_size, ), x.is_cuda)
+
+        log_pi = torch.stack(output_map['log_pi']).transpose(1, 0)
+        baselines = torch.stack(output_map['baselines']).transpose(1, 0)
 
         for i in range(n_sacc):
-            log_pi += output_map['log_pi'][i]
-            baselines += output_map['baselines'][i]
-            mu = output_map['params'][i]['posterior']['gaussian']['mu']
-            log_var = torch.tanh(output_map['params'][i]['posterior']['gaussian']['logvar'])
-            loss_actions[i] += torch.sum(D.Normal(mu, log_var).log_prob(locations[i]))
 
-        log_pi /= n_sacc
-        baselines /= n_sacc
+            mu = output_map['params'][i]['posterior']['gaussian']['mu']
+            log_var = torch.sigmoid(output_map['params'][i]['posterior']['gaussian']['logvar'])
+            # log_var = torch.ones_like(mu)
+
+            nan_check_and_break(mu, "mu")
+            nan_check_and_break(log_var, "log_var")
+            zero_check_and_break(log_var, "log_var")
+
+            val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]))
+            nan_check_and_break(val, "D.Normal val")
+
+            loss_actions[i] += val
+
         loss_actions /= n_sacc
 
+        nan_check_and_break(log_pi, "log_pi")
+        nan_check_and_break(baselines, "baselines")
+        nan_check_and_break(loss_actions, "loss_actions")
 
         # Calculate reward, needs possible unroll
         R = (predicted.detach() == labels).float()
@@ -208,12 +203,16 @@ class SaccaderReinforce(Saccader):
         adjusted_reward = R - baselines.detach()
         loss_reinforce = -log_pi * adjusted_reward
 
+        loss_actions /= x.shape[0]
+        loss_baseline /= x.shape[0]
+        loss_reinforce /= x.shape[0]
+
         loss = torch.mean(loss_actions + loss_baseline + loss_reinforce)
 
         loss_map = {}
-        loss_map['actions_mean'] = loss_actions
+        loss_map['actions_mean'] = torch.mean(loss_actions)
         loss_map['baselines_mean'] = loss_baseline
-        loss_map['reinforce_mean'] = loss_reinforce
+        loss_map['reinforce_mean'] = torch.mean(loss_reinforce)
         loss_map['loss_mean'] = loss
 
         return loss_map
