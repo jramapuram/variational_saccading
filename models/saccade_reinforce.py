@@ -100,11 +100,6 @@ class SaccaderReinforce(Saccader):
                 x_preds / self.config['max_time_steps']
             )
 
-            # Make tensors
-            locs = torch.stack(locs)
-            log_pi = torch.stack(log_pi)
-            baselines = torch.stack(baselines)
-
             return {
                 'location': locs,
                 'log_pi': log_pi,
@@ -165,14 +160,14 @@ class SaccaderReinforce(Saccader):
         nan_check_and_break(locations, "locations")
         nan_check_and_break(log_probas, "log_probas")
 
-        # log_pi = zeros((batch_size, ), x.is_cuda)
-        # baselines = zeros((batch_size, ), x.is_cuda)
-        # loss_actions = zeros((batch_size, ), x.is_cuda)
-
-        log_pi = torch.stack(output_map['log_pi']).transpose(1, 0)
-        baselines = torch.stack(output_map['baselines']).transpose(1, 0)
+        log_pi = zeros((batch_size, ), x.is_cuda)
+        baselines = zeros((batch_size, ), x.is_cuda)
+        loss_actions = zeros((batch_size, ), x.is_cuda)
 
         for i in range(n_sacc):
+
+            log_pi += output_map['log_pi'][i]
+            baselines += output_map['baselines'][i]
 
             mu = output_map['params'][i]['posterior']['gaussian']['mu']
             log_var = torch.sigmoid(output_map['params'][i]['posterior']['gaussian']['logvar'])
@@ -182,12 +177,14 @@ class SaccaderReinforce(Saccader):
             nan_check_and_break(log_var, "log_var")
             zero_check_and_break(log_var, "log_var")
 
-            val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]))
+            val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]), -1)
             nan_check_and_break(val, "D.Normal val")
 
-            loss_actions[i] += val
+            loss_actions += val
 
         loss_actions /= n_sacc
+        log_pi /= n_sacc
+        baselines /= n_sacc
 
         nan_check_and_break(log_pi, "log_pi")
         nan_check_and_break(baselines, "baselines")
@@ -197,21 +194,17 @@ class SaccaderReinforce(Saccader):
         R = (predicted.detach() == labels).float()
 
         # Baseline compensation
-        loss_baseline = F.mse_loss(baselines, R)
+        loss_baseline = torch.sum(F.mse_loss(baselines, R, reduction='none'), -1)
 
         # Compute reinforce loss, sum over time-steps and average the batch
         adjusted_reward = R - baselines.detach()
         loss_reinforce = -log_pi * adjusted_reward
 
-        loss_actions /= x.shape[0]
-        loss_baseline /= x.shape[0]
-        loss_reinforce /= x.shape[0]
-
         loss = torch.mean(loss_actions + loss_baseline + loss_reinforce)
 
         loss_map = {}
         loss_map['actions_mean'] = torch.mean(loss_actions)
-        loss_map['baselines_mean'] = loss_baseline
+        loss_map['baselines_mean'] = torch.mean(loss_baseline)
         loss_map['reinforce_mean'] = torch.mean(loss_reinforce)
         loss_map['loss_mean'] = loss
 
