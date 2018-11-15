@@ -211,7 +211,7 @@ class SaccaderReinforce(Saccader):
         loss_map['reinforce_mean'] = torch.mean(loss_reinforce)
 
         # Hack
-        loss_map['pred_loss_mean'] = loss
+        loss_map['pred_loss_mean'] = loss.detach()
         loss_map['loss_mean'] = loss
 
         return loss_map
