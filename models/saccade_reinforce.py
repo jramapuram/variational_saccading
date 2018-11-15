@@ -8,7 +8,7 @@ import torch.distributions as D
 from copy import deepcopy
 
 from helpers.utils import expand_dims, check_or_create_dir, \
-    zeros_like, int_type, nan_check_and_break, zeros, get_dtype, \
+    zeros_like, int_type, nan_check_and_break, zeros, get_dtype, uniform,\
     plot_tensor_grid, add_noise_to_imgs, zero_check_and_break
 from helpers.layers import View, Identity, get_encoder, str_to_activ_module
 from .image_state_projector import ImageStateProjector
@@ -36,7 +36,8 @@ class SaccaderReinforce(Saccader):
             self.vae.memory.init_output(batch_size, seqlen=1, cuda=x_related.is_cuda)
 
             # reset the location
-            l_t = torch.Tensor(x.shape[0], 2).uniform_(-1, 1)
+            l_t = uniform((x.shape[0], 2), cuda=x_related.is_cuda, a=-1, b=1).requires_grad_()
+            # l_t = torch.Tensor(x.shape[0], 2).uniform_(-1, 1)
 
             # accumulator for predictions and ACT
             x_preds = zeros((batch_size, self.config['latent_size']),
@@ -174,15 +175,10 @@ class SaccaderReinforce(Saccader):
 
             mu = output_map['params'][i]['posterior']['gaussian']['mu']
             log_var = torch.sigmoid(output_map['params'][i]['posterior']['gaussian']['logvar'])
-            # log_var = torch.ones_like(mu)
 
             nan_check_and_break(mu, "mu")
             nan_check_and_break(log_var, "log_var")
             zero_check_and_break(log_var, "log_var")
-
-            # print('shape locations [] {}'.format(locations[i].size()))
-            # print('shape mu [] {}'.format(mu.size()))
-            # print('shape log_var [] {}'.format(log_var.size()))
 
             val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]), -1)
             nan_check_and_break(val, "D.Normal val")
