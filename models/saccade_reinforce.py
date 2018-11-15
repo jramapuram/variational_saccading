@@ -75,10 +75,12 @@ class SaccaderReinforce(Saccader):
                 z_t, params_t = self.vae.posterior(x_trunc_t)
 
                 #  locator forward, based on hidden state
-                mu, l_t = self.vae.get_locator()
+                # l_t = F.tanh(z_t['posterior'].detach())
+                l_t = F.tanh(params_t['posterior']['gaussian']['mu'].detach())
+                # mu, l_t = self.vae.get_locator()
 
-                p = D.Normal(mu, self.config['std']).log_prob(l_t)
-                p = torch.sum(p, dim=1)
+                # p = D.Normal(mu, self.config['std']).log_prob(l_t)
+                # p = torch.sum(p, dim=1)
 
                 nan_check_and_break(x_related_inference, "x_related_inference")
                 nan_check_and_break(z_t['prior'], "prior")
@@ -93,7 +95,7 @@ class SaccaderReinforce(Saccader):
                 crops.append(x_trunc_t)
 
                 locs.append(l_t)
-                log_pi.append(p)
+                # log_pi.append(p)
                 baselines.append(base_score.squeeze())
 
             # After last time step
@@ -103,7 +105,7 @@ class SaccaderReinforce(Saccader):
 
             return {
                 'location': locs,
-                'log_pi': log_pi,
+                # 'log_pi': log_pi,
                 'baselines': baselines,
                 'act': act / max(i, 1),
                 'saccades_scalar': i,
@@ -170,7 +172,6 @@ class SaccaderReinforce(Saccader):
 
         for i in range(n_sacc):
 
-            log_pi += output_map['log_pi'][i]
             baselines += output_map['baselines'][i]
 
             mu = output_map['params'][i]['posterior']['gaussian']['mu']
@@ -183,9 +184,8 @@ class SaccaderReinforce(Saccader):
             val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]), -1)
             nan_check_and_break(val, "D.Normal val")
 
-            loss_actions += val
+            log_pi += val
 
-        loss_actions /= n_sacc
         log_pi /= n_sacc
         baselines /= n_sacc
 
@@ -193,11 +193,16 @@ class SaccaderReinforce(Saccader):
         nan_check_and_break(baselines, "baselines")
         nan_check_and_break(loss_actions, "loss_actions")
 
+        loss_actions = F.nll_loss(output_map['preds'], labels, reduction='none')
+
         # Calculate reward, needs possible unroll
         R = (predicted.detach() == labels).float()
 
         # Baseline compensation
-        loss_baseline = torch.sum(F.mse_loss(baselines, R, reduction='none'), -1)
+        # loss_baseline = torch.sum(F.mse_loss(baselines, R, reduction='none'), -1)
+        loss_baseline = F.mse_loss(baselines, R, reduction='none')
+
+        assert(loss_baseline.size(0) == baselines.size(0))
 
         # Compute reinforce loss, sum over time-steps and average the batch
         adjusted_reward = R - baselines.detach()
@@ -205,13 +210,20 @@ class SaccaderReinforce(Saccader):
 
         loss = torch.mean(loss_actions + loss_baseline + loss_reinforce)
 
+        assert(loss_actions.size() == loss_baseline.size())
+        assert(loss_actions.size() == loss_reinforce.size())
+
+        # print('loss actions size {}'.format(loss_actions.size()))
+        # print('loss baseline size {}'.format(loss_baseline.size()))
+        # print('loss reinforce size {}'.format(loss_reinforce.size()))
+
         loss_map = {}
         loss_map['actions_mean'] = torch.mean(loss_actions)
         loss_map['baselines_mean'] = torch.mean(loss_baseline)
         loss_map['reinforce_mean'] = torch.mean(loss_reinforce)
 
         # Hack
-        loss_map['pred_loss_mean'] = loss.detach()
+        loss_map['pred_loss_mean'] = loss
         loss_map['loss_mean'] = loss
 
         return loss_map

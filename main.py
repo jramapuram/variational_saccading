@@ -112,7 +112,7 @@ parser.add_argument('--max-time-steps', type=int, default=4,
 # (REINFORCE) loss related
 parser.add_argument('--use-reinforce', action='store_true',
                     help='Use hard crops and REINFORCE loss (default: False)')
-parser.add_argument('--std', type=int, default=0.17, help='standard deviation for locator sampler (default: 0.17)')
+parser.add_argument('--std', type=float, default=0.17, help='standard deviation for locator sampler (default: 0.17)')
 
 # Regularizer related
 parser.add_argument('--continuous-mut-info', type=float, default=0,
