@@ -395,7 +395,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
 
     # add individual loss vectors
     print('{}[Epoch {}][{} samples][{:.2f} sec]:\
-    Average loss: {:.4f}\t Action loss: {:.4f}\t Baseline loss: {:.4f}\t REINFORCE loss :{:.4f}\t tAcc: {:.4f}'.format(
+    Average loss: {:.4f}\t Action loss: {:.4f}\t Baseline loss: {:.4f}\t REINFORCE loss :{:.4f}\t Acc: {:.4f}'.format(
         prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['actions_mean'].item(),

@@ -109,7 +109,7 @@ class SaccaderReinforce(Saccader):
                 # 'decoded': decodes,
                 'params': params,
                 'preds': preds,
-                'crops': x_trunc_t
+                'crops': crops
             }
 
         # forward pass with decoding [normal]
@@ -152,13 +152,16 @@ class SaccaderReinforce(Saccader):
         batch_size = x.shape[0]
 
         log_probas = output_map['preds']
+
+        # Perhaps add cross-entrop labels-preds here for early stopping
+
         predicted = torch.max(log_probas, 1)[1]
 
         # Losses for differential modules
         locations = output_map['location']
 
-        nan_check_and_break(locations, "locations")
-        nan_check_and_break(log_probas, "log_probas")
+        # nan_check_and_break(torch.stack(locations), "locations")
+        # nan_check_and_break(torch.stack(log_probas), "log_probas")
 
         log_pi = zeros((batch_size, ), x.is_cuda)
         baselines = zeros((batch_size, ), x.is_cuda)
@@ -176,6 +179,10 @@ class SaccaderReinforce(Saccader):
             nan_check_and_break(mu, "mu")
             nan_check_and_break(log_var, "log_var")
             zero_check_and_break(log_var, "log_var")
+
+            # print('shape locations [] {}'.format(locations[i].size()))
+            # print('shape mu [] {}'.format(mu.size()))
+            # print('shape log_var [] {}'.format(log_var.size()))
 
             val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]), -1)
             nan_check_and_break(val, "D.Normal val")
@@ -206,6 +213,9 @@ class SaccaderReinforce(Saccader):
         loss_map['actions_mean'] = torch.mean(loss_actions)
         loss_map['baselines_mean'] = torch.mean(loss_baseline)
         loss_map['reinforce_mean'] = torch.mean(loss_reinforce)
+
+        # Hack
+        loss_map['pred_loss_mean'] = loss
         loss_map['loss_mean'] = loss
 
         return loss_map
@@ -294,3 +304,13 @@ class SaccaderReinforce(Saccader):
         ):
             return True
         return False
+
+    def get_auxiliary_imgs(self, output_map, crop_resize=(64, 64), decode_resize=(32, 32)):
+        ''' simple helper to go through the output map and grab all the images and labels'''
+        imgs_map = {}
+        assert 'crops' in output_map and isinstance(output_map['crops'], list)  # sanity
+        for i, crop in enumerate(output_map['crops']):
+            imgs_map['softcrop{}_imgs'.format(i)] = F.interpolate(
+                crop, crop_resize, mode='bilinear')  # grab softcrops
+
+        return imgs_map
