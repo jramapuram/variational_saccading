@@ -356,7 +356,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                 # compute accuracy and aggregate into map
                 accuracy_fn = softmax_accuracy if len(labels.shape) == 1 else bce_accuracy
                 loss_t['accuracy_mean'] = accuracy_fn(
-                    F.softmax(output_map['preds'], -1),
+                    output_map['preds'],
                     labels, size_average=True
                 )
 

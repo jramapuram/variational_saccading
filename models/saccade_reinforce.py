@@ -103,6 +103,11 @@ class SaccaderReinforce(Saccader):
                 x_preds / self.config['max_time_steps']
             )
 
+            # check preds here
+            nan_check_and_break(preds, "preds")
+
+            # print('pred size: {}'.format(preds.size()))
+
             return {
                 'location': locs,
                 # 'log_pi': log_pi,
@@ -138,18 +143,6 @@ class SaccaderReinforce(Saccader):
 
     # Reinforce loss
     def loss_function(self, x, labels, output_map):
-
-        # Need
-        # 1)
-        # soft predictions, log_probas
-        # 2)
-        # Log_pi depend on hidden state, log_pi = log N (mu, std)
-        # log_pi = Normal(mu, self.std).log_prob(l_t)
-        # log_pi = torch.sum(log_pi, dim=1)
-        # log_pi =
-        # 3) predicted
-        # Hard class prediction
-        # 4) baselines
 
         n_sacc = self.config['max_time_steps']
         batch_size = x.shape[0]
