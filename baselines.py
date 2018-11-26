@@ -676,8 +676,6 @@ class MultiBatchModule(nn.Module):
             #     # i.e. the naive setting
             #     x = x.view(-1, *x.shape[-3:])
 
-            print("here! x = ", x.shape)
-            exit(0)
             logits = self.model(x.cuda())
 
         return self.proj(logits)

@@ -15,11 +15,14 @@ class ImageStateProjector(nn.Module):
 
     def forward(self, x, state):
         conv_features = self.conv(x)
-        # combined = str_to_activ(self.config['activation'])(
-        #     torch.cat([state, conv_features], -1)
-        # )
-        combined = torch.cat([state, conv_features], -1)
-        return self.state_proj(combined)
+        if not self.config['disable_rnn_proj']:
+            # combined = str_to_activ(self.config['activation'])(
+            #     torch.cat([state, conv_features], -1)
+            # )
+            combined = torch.cat([state, conv_features], -1)
+            return self.state_proj(combined)
+
+        return self.state_proj(conv_features)
 
     def fp16(self):
         self.conv = self.conv.half()
@@ -64,17 +67,23 @@ class ImageStateProjector(nn.Module):
 
         # takes the state + output of conv and projects it
         # the +1 is for ACT
+        state_output_size = self.config['latent_size'] + 1 if self.config['concat_prediction_size'] <= 0 \
+            else self.config['concat_prediction_size'] + 1
+        state_input_size = self.config['latent_size'] if self.config['disable_rnn_proj'] \
+            else self.config['latent_size']*2
         state_projector = nn.Sequential(
             self._get_dense(name='state_proj')(
-                self.config['latent_size']*2, self.config['latent_size']+1,
+                state_input_size, state_output_size,
                 normalization_str=self.config['dense_normalization'],
                 activation_fn=str_to_activ_module(self.config['activation'])
             )
         )
 
         # takes the finally aggregated vector and projects to output dims
+        input_size = self.config['concat_prediction_size'] * self.config['max_time_steps'] \
+            if self.config['concat_prediction_size'] > 0 else self.config['latent_size']
         output_projector = self._get_dense(name='output_proj')(
-            self.config['latent_size'], self.output_size,
+            input_size, self.output_size,
             normalization_str=self.config['dense_normalization'],
             activation_fn=str_to_activ_module(self.config['activation'])
         )

@@ -1,5 +1,8 @@
 import os
+import uuid
+import git
 import pprint
+import tarfile
 import time
 import boto3
 import argparse
@@ -80,6 +83,24 @@ def attach_tag(instance_list, tag=None):
         client.create_tags(Resources=instance_list,
                            Tags=[{'Key':'name', 'Value':tag}])
 
+
+def get_git_root():
+    ''' helper to get the root git dir'''
+    git_repo = git.Repo(".", search_parent_directories=True)
+    return git_repo.git.rev_parse("--show-toplevel")
+
+
+def tar_current_project():
+    ''' helper to zip the root of this git-dir'''
+    output_filename="project_{}.tar.gz".format(uuid.uuid4().hex)
+    print("compressing current git repo for deployment...", end='', flush=True)
+    source_dir = get_git_root()
+    with tarfile.open(output_filename, "w:gz") as tar:
+        tar.add(source_dir, arcname=os.path.basename(source_dir))
+
+    print("done!")
+
+
 def instances_to_ips(instance_list):
     assert isinstance(instance_list, list), "need a list as input"
 
@@ -119,7 +140,9 @@ def get_launch_spec(args, custom_zone=None):
         'DeviceName': '/dev/sda1',
         'Ebs':{
             'DeleteOnTermination': True,
-            'VolumeType': 'gp2',
+            'VolumeType': 'io1',
+            'Iops': 5000,
+            # 'VolumeType': 'gp2',
             'VolumeSize': args.storage_size
         }
     }
@@ -151,7 +174,8 @@ def create_spot(args):
         max_price = cheapest_price * args.upper_bound_spot_multiplier
         print("setting max price to {}".format(max_price))
 
-        zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
+        #zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
+        zone_override = None if args.instance_zone is None else args.instance_zone
         launch_spec_dict = get_launch_spec(args, zone_override)
 
         # request the node(s)
@@ -257,7 +281,7 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     # build the final command to send over ssh
     orig_cmd = cmd # cache for use in file transfer
     cmd = "{} ; tmux new-session -d -s runtime; \
-    tmux send-keys \"{} > ~/setup.log ; sh /tmp/{} > ~/cmd.log ; {} ; {} \" C-m ; \
+    tmux send-keys \"{} &> ~/setup.log ; sh /tmp/{} &> ~/cmd.log ; {} ; {} \" C-m ; \
     tmux detach -s runtime".format(
         tmux_cmd, setup_cmd, cmd, log_cmd, shutdown_cmd
     )
@@ -265,9 +289,14 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     # setup client
     client.connect(hostname=hostname, username=username, pkey=key)
 
+    # tar the current project
+    tar_current_project()
+
     # send all files from current directory to remote server
     all_files = [local_file for local_file in os.listdir(".")
-                 if local_file == 'setup.sh' or local_file == orig_cmd]
+                 if local_file == 'setup.sh'
+                 or local_file == orig_cmd
+                 or ('project' in local_file and "tar.gz" in local_file)]
     print("transferring {} to host {}".format(all_files, hostname))
     for local_file in all_files:
         remote_file = os.path.join("/tmp", os.path.basename(local_file))

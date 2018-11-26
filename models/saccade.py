@@ -13,7 +13,8 @@ from helpers.layers import View, Identity, get_encoder, str_to_activ_module
 from .image_state_projector import ImageStateProjector
 from .numerical_diff_module import NumericalDifferentiator
 from .spatial_transformer import SpatialTransformer
-from datasets.crop_dual_imagefolder import CropLambdaPool, USE_LIB
+from .localized_spatial_transformer4 import LocalizedSpatialTransformer, \
+    pool_to_imgs, theta_to_grid
 
 
 class Saccader(nn.Module):
@@ -23,18 +24,6 @@ class Saccader(nn.Module):
         self.output_size = output_size
         self.config = kwargs['kwargs']
 
-        # build the pool object to multi-process images
-        if USE_LIB == 'rust':
-            self.pool = CropLambdaPool(window_size=self.config['window_size'],
-                                       chans=self.vae.chans,
-                                       max_image_percentage=self.config['max_image_percentage'])
-        else:
-            self.pool = CropLambdaPool(num_workers=self.config['batch_size'])
-            #self.pool = CropLambdaPool(num_workers=1)  # disables
-            #self.pool = CropLambdaPool(num_workers=-1) # auto-pool
-            #self.pool = CropLambdaPool(num_workers=24) # fixed pool
-
-
         # build the projection to softmax from RNN state
         self.latent_projector = ImageStateProjector(output_size=self.output_size,
                                                     config=self.config)
@@ -42,8 +31,10 @@ class Saccader(nn.Module):
         # build the inlay projector
         self.numgrad = NumericalDifferentiator(self.config)
 
-        # build the spatial transformer
-        self.spatial_transformer = SpatialTransformer(self.config)
+        # build the spatial transformer (or local spatial transformer)
+        self.spatial_transformer = SpatialTransformer(self.config) \
+            if self.config['task'] != 'crop_dual_imagefolder' \
+               else LocalizedSpatialTransformer(self.vae.chans, self.config)
 
         # build the projector from the posterior to the ST params
         self.posterior_to_st = nn.Sequential(self._get_dense('posterior_to_st_proj')(
@@ -115,9 +106,15 @@ class Saccader(nn.Module):
             if isinstance(img, torch.Tensor):
                 return_map[name] = F.interpolate(img, resize, mode='bilinear')
             else: # we are in the case of lambda operands
-                z = np.tile(np.array([[1.0, 0.0, 0.0]]), (batch_size, 1))
-                #original_full_img, _, _ = self._pool_to_imgs(z, img, override=True)
-                original_full_img = self._pool_to_imgs(z, img, override=True)
+                theta = torch.from_numpy(np.tile(np.array([[1.0, 0.0, 0.0]]),
+                                                 (batch_size, 1)))
+                window_shape = (theta.shape[0], self.vae.chans, *resize)
+                grid = theta_to_grid(theta, window_shape,
+                                     self.config['img_shp'],
+                                     max_image_percentage=1.0)
+                _, _, original_full_img = pool_to_imgs(
+                    self.spatial_transformer.pool, img, grid, override=True
+                )
                 return_map[name] = F.interpolate(original_full_img, resize, mode='bilinear')
 
         return return_map
@@ -168,13 +165,6 @@ class Saccader(nn.Module):
         pred_loss = torch.sum(pred_loss, -1) if len(pred_loss.shape) > 1 else pred_loss
         nan_check_and_break(pred_loss, "pred_loss")
 
-        # the crop prediction loss [ only for lambda images ]
-        # crop_loss = self.numgrad.loss_function(
-        #     output_map['crops'],
-        #     output_map['crops_true']
-        # ) if len(output_map['crops_true']) > 0 else torch.zeros_like(pred_loss)
-        crop_loss = torch.zeros_like(pred_loss)
-
         # ACT loss
         vae_loss_map['saccades_scalar'] = output_map['saccades_scalar']
         act_loss = torch.zeros_like(pred_loss)
@@ -185,20 +175,19 @@ class Saccader(nn.Module):
         # )
 
         # TODO: try multi-task loss, ie:
-        # vae_loss_map['loss'] = vae_loss_map['loss'] + (pred_loss + crop_loss + act_loss)
-        vae_loss_map['loss'] = vae_loss_map['loss'] * (pred_loss + crop_loss + act_loss)
+        # vae_loss_map['loss'] = vae_loss_map['loss'] + (pred_loss + act_loss)
+        vae_loss_map['loss'] = vae_loss_map['loss'] * (pred_loss + act_loss)
 
         # compute the means for visualizations of bp
         vae_loss_map['act_loss_mean'] = torch.mean(act_loss)
         vae_loss_map['pred_loss_mean'] = torch.mean(pred_loss)
-        vae_loss_map['crop_loss_mean'] = torch.mean(crop_loss)
         vae_loss_map['loss_mean'] = torch.mean(vae_loss_map['loss'])
         return vae_loss_map
 
     def _z_to_image_transformer(self, z, imgs):
-        imgs = imgs.type(z.dtype)
+        imgs = imgs.type(z.dtype) if isinstance(imgs, torch.Tensor) else imgs
         z_proj = self.posterior_to_st(z)
-        crops_pred = self.spatial_transformer(z_proj, imgs)
+        crops_pred = self.spatial_transformer(z_proj, imgs, self.vae.chans)
         nan_check_and_break(crops_pred, "predicted_crops_t")
         return {
             'crops_pred': crops_pred
@@ -224,42 +213,17 @@ class Saccader(nn.Module):
         }
         return clamp_map[self.config['reparam_type']](z)
 
-
-    def _z_to_image_lambda(self, z, imgs):
-        ''' run the z's through the threadpool, returning inlays and true crops'''
-        clamped_z = self._clamp_sample(z[:, 0:3])  # clamp to [0, 1] range
-        crops = self._pool_to_imgs(clamped_z, imgs)
-        predicted_crops = self.numgrad(z, crops)
-
-        nan_check_and_break(predicted_crops, "predicted_crops_t")
-
-        return {
-            'crops_pred': predicted_crops
-        }
-
-    def _pool_to_imgs(self, z, imgs, override=False):
-        # tabulate the crops using the threadpool and re-stitch together
-        z_np = z.clone().detach().cpu().numpy() if not isinstance(z, np.ndarray) else z
-        pool_tabulated = self.pool(imgs, z_np, override=override)
-        crops = torch.cat(pool_tabulated, 0)
-
-        # memory cleanups
-        del pool_tabulated
-
-        # push to cuda if necessary
-        is_cuda = z.is_cuda if isinstance(z, torch.Tensor) else False
-        return crops.cuda() if is_cuda else crops
-
     def _z_to_image(self, z, imgs):
         ''' accepts images (or lambdas to crop) and z (gauss or disc)
             and returns an [N, C, H_trunc, W_trunc] array '''
         assert len(imgs) == z.shape[0], "batch sizes for crop preds vs imgs dont match"
-        crop_fn_map = {
-            'transformer': self._z_to_image_transformer,
-            'lambda': self._z_to_image_lambda
-        }
-        crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
-        return crop_fn_map[crop_type](z, imgs)
+        # crop_fn_map = {
+        #     'transformer': self._z_to_image_transformer,
+        #     'lambda': self._z_to_image_lambda
+        # }
+        # crop_type = 'transformer' if isinstance(imgs, torch.Tensor) else 'lambda'
+        # return crop_fn_map[crop_type](z, imgs)
+        return self._z_to_image_transformer(z, imgs)
 
     def generate(self, batch_size):
         self.eval()
@@ -285,11 +249,14 @@ class Saccader(nn.Module):
             self.vae.memory.init_output(batch_size, seqlen=1, cuda=x_related.is_cuda)
 
             # accumulator for predictions and ACT
-            x_preds = zeros((batch_size, self.config['latent_size']),
-                            cuda=x_related.is_cuda,
-                            dtype=get_dtype(x_related)).requires_grad_()
             act = zeros((batch_size, 1), cuda=x_related.is_cuda,
                         dtype=get_dtype(x_related)).squeeze().requires_grad_()
+            if self.config['concat_prediction_size'] <= 0:
+                x_preds = zeros((batch_size, self.config['latent_size']),
+                                cuda=x_related.is_cuda,
+                                dtype=get_dtype(x_related)).requires_grad_()
+            else: # the below creates a buffer that can concat results
+                x_preds = [] # just concat this and project
 
             for i in range(self.config['max_time_steps']):
                 # get posterior and params, expand 0'th dim for seqlen
@@ -310,7 +277,13 @@ class Saccader(nn.Module):
                 crops_pred_perturbed = add_noise_to_imgs(x_trunc_t['crops_pred']) \
                     if self.config['add_img_noise'] else x_trunc_t['crops_pred']
                 state_proj = self.latent_projector(crops_pred_perturbed, state)
-                x_preds = x_preds + state_proj[:, 0:-1] # last bit is for ACT
+
+                # add to crops if concat_prediction_size is not specified
+                # otherwise use a concatenation strategy
+                if self.config['concat_prediction_size'] <= 0:
+                    x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
+                else:
+                    x_preds.append(state_proj[:, 0:-1])  # last bit is for ACT
 
                 # decode the posterior
                 decoded_t = self.vae.decode(z_t, produce_output=True)
@@ -331,6 +304,8 @@ class Saccader(nn.Module):
                 # if torch.max(act / max(i, 1)) >= 0.9998:
                 #     break
 
+            # stack if we are using the concat solution
+            x_preds = torch.cat(x_preds, -1) if self.config['concat_prediction_size'] > 0 else x_preds
             preds = self.latent_projector.get_output(
                 x_preds / self.config['max_time_steps']
             )

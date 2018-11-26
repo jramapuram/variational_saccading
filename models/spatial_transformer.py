@@ -12,9 +12,9 @@ class SpatialTransformer(nn.Module):
         super(SpatialTransformer, self).__init__()
         self.config = config
 
-    def forward(self, z, imgs):
+    def forward(self, z, imgs, chans):
         assert z.size(1) == 3, "spatial transformer currently only operates over 3-features dims"
-        return self.image_to_window(z, self.config['window_size'], imgs,
+        return self.image_to_window(z, chans, self.config['window_size'], imgs,
                                     max_image_percentage=self.config['max_image_percentage'])
 
     # the folowing few helpers are from pyro example for AIR
@@ -91,7 +91,7 @@ class SpatialTransformer(nn.Module):
         return out.view(n, 1, image_size, image_size)
 
     @staticmethod
-    def image_to_window(z_where, window_size, images, max_image_percentage=0.15):
+    def image_to_window(z_where, chans, window_size, images, max_image_percentage=0.15):
         ''' max_percentage is the maximum scale possible for the window
 
             example sizes:
@@ -113,6 +113,6 @@ class SpatialTransformer(nn.Module):
             theta_inv_trunc = theta_inv
             images_trunc = images
 
-        grid = F.affine_grid(theta_inv_trunc, torch.Size((n, 1, window_size, window_size)))
+        grid = F.affine_grid(theta_inv_trunc, torch.Size((n, chans, window_size, window_size)))
         out = F.grid_sample(images_trunc.view(n, *image_size), grid)
         return out.type(z_where.dtype)

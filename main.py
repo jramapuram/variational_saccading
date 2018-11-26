@@ -5,8 +5,8 @@ import psutil
 import argparse
 import numpy as np
 import pprint
-import torchvision
 import torch
+import torchvision
 import functools
 import torch.optim as optim
 import torch.nn as nn
@@ -91,8 +91,12 @@ parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--vae-type', type=str, default='vrnn',
                     help='vae type [sequential / parallel / vrnn] (default: parallel)')
-parser.add_argument('--disable-gated', action='store_true',
+parser.add_argument('--disable-gated', action='store_true', default=False,
                     help='disables gated convolutional or dense structure (default: False)')
+parser.add_argument('--disable-rnn-proj', action='store_true', default=False,
+                    help='disables the rnn connection from to the concat of the crop-logits (default: False)')
+parser.add_argument('--concat-prediction-size', type=int, default=0,
+                    help='a value greater than 0 uses the concatenate based classifier (default: 0)')
 parser.add_argument('--restore', type=str, default=None,
                     help='path to a model to restore (default: None)')
 
@@ -441,7 +445,9 @@ def get_model_and_loader():
                                                       args.synthetic_upsample_size),
                                                 mode='bilinear', align_corners=True).squeeze(0)
 
-    loader = get_loader(args, transform=None,
+    # resizer = torchvision.transforms.Resize(size=(args.synthetic_upsample_size,
+    #                                               args.synthetic_upsample_size))
+    loader = get_loader(args, transform=None, #transform=[resizer],
                         sequentially_merge_test=False,
                         aux_transform=aux_transform,
                         postfix="_large", **vars(args))
