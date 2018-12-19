@@ -413,8 +413,8 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
         loss_map['cudamem_scalar'] = torch.cuda.memory_allocated() * 1e-6
 
     # plot all the scalar / mean values
-    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-
+    register_plots({**loss_map, **reparam_scalars},
+                   grapher, epoch=epoch, prefix=prefix)
     # plot images, crops, inlays and all relevant images
     input_imgs_map = {'related_imgs': x_related, 'original_imgs': x_original}
     imgs_map = model.get_imgs(x_related.size(0), output_map, input_imgs_map)
