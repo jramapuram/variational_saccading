@@ -180,7 +180,6 @@ class SaccaderReinforce(Saccader):
 
             nan_check_and_break(mu, "mu")
             nan_check_and_break(log_var, "log_var")
-            zero_check_and_break(log_var, "log_var")
 
             # This is wrong
             val = torch.sum(D.Normal(mu, log_var + eps()).log_prob(locations[i]), -1)
