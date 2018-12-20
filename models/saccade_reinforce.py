@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from helpers.utils import expand_dims, check_or_create_dir, \
     zeros_like, int_type, nan_check_and_break, zeros, get_dtype, uniform,\
-    plot_tensor_grid, add_noise_to_imgs, zero_check_and_break
+    plot_tensor_grid, add_noise_to_imgs, zero_check_and_break, eps
 from helpers.layers import View, Identity, get_encoder, str_to_activ_module
 from .image_state_projector import ImageStateProjector
 from .numerical_diff_module import NumericalDifferentiator
@@ -157,6 +157,7 @@ class SaccaderReinforce(Saccader):
         batch_size = x.shape[0]
 
         log_probas = output_map['preds']
+        nan_check_and_break(log_probas, "log_probas")
 
         # Perhaps add cross-entrop labels-preds here for early stopping
 
@@ -166,8 +167,6 @@ class SaccaderReinforce(Saccader):
         locations = output_map['location']
 
         # nan_check_and_break(torch.stack(locations), "locations")
-        nan_check_and_break(log_probas, "log_probas")
-
         log_pi = zeros((batch_size, ), x.is_cuda)
         baselines = zeros((batch_size, ), x.is_cuda)
         loss_actions = zeros((batch_size, ), x.is_cuda)
@@ -183,7 +182,11 @@ class SaccaderReinforce(Saccader):
             nan_check_and_break(log_var, "log_var")
             zero_check_and_break(log_var, "log_var")
 
-            val = torch.sum(D.Normal(mu, log_var).log_prob(locations[i]), -1)
+            # This is wrong
+            val = torch.sum(D.Normal(mu, log_var + eps()).log_prob(locations[i]), -1)
+            # if torch.sum(val) > 4000:
+            #     print(locations[i])
+
             nan_check_and_break(val, "D.Normal val")
 
             log_pi += val
@@ -200,9 +203,14 @@ class SaccaderReinforce(Saccader):
         # Calculate reward, needs possible unroll
         R = (predicted.detach() == labels).float()
 
+        nan_check_and_break(R, 'R')
+        nan_check_and_break(predicted.float().detach().cpu(), 'predicted')
+
         # Baseline compensation
         # loss_baseline = torch.sum(F.mse_loss(baselines, R, reduction='none'), -1)
         loss_baseline = F.mse_loss(baselines, R, reduction='none')
+
+        nan_check_and_break(loss_baseline, 'loss_baseline')
 
         assert(loss_baseline.size(0) == baselines.size(0))
 
@@ -210,7 +218,12 @@ class SaccaderReinforce(Saccader):
         adjusted_reward = R - baselines.detach()
         loss_reinforce = -log_pi * adjusted_reward
 
+        nan_check_and_break(adjusted_reward, 'adjusted_reward')
+        nan_check_and_break(loss_reinforce, 'loss_reinforce')
+
         loss = torch.mean(loss_actions + loss_baseline + loss_reinforce)
+
+        nan_check_and_break(loss, 'final loss')
 
         assert(loss_actions.size() == loss_baseline.size())
         assert(loss_actions.size() == loss_reinforce.size())

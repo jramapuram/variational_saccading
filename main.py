@@ -14,6 +14,9 @@ import torch.nn.functional as F
 from copy import deepcopy
 from torch.autograd import Variable
 
+import matplotlib
+matplotlib.use('Agg')
+
 
 from models.vae.vrnn import VRNN
 from models.vae.vrnn_reinforce import VRNNReinforce
@@ -360,6 +363,9 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                     labels, size_average=True
                 )
 
+                if loss_t['accuracy_mean'] * 100.0 > 100:
+                    print(output_map['preds'])
+
                 loss_map = _add_loss_map(loss_map, loss_t)
                 num_samples += x_related.size(0)
 
@@ -379,7 +385,20 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                     if not args.half is True else optimizer.clip_master_grads(args.clip)
 
             optimizer.step()
+
+            # add individual loss vectors
+            # iter_loss_map = _mean_map(loss_map)
+            # print('{}[Epoch {}][{} samples]:\
+            #     Average loss: {:.4f}\t Action loss: {:.4f}\t Baseline loss: {:.4f}\t REINFORCE loss :{:.4f}'.format(
+            #     prefix, epoch, num_samples,
+            #     iter_loss_map['loss_mean'].item(),
+            #     iter_loss_map['actions_mean'].item(),
+            #     iter_loss_map['baselines_mean'].item(),
+            #     iter_loss_map['reinforce_mean'].item()
+            #     ))
+
             del loss_t
+
 
     loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     correct_percent = 100.0 * loss_map['accuracy_mean']
