@@ -70,6 +70,10 @@ class SaccaderReinforce(Saccader):
 
                 state = torch.mean(self.vae.memory.get_state()[0], 0)
                 state_proj = self.latent_projector(crops_pred_perturbed, state)
+
+                nan_check_and_break(state, 'state')
+                nan_check_and_break(state_proj, 'state_proj')
+
                 x_preds = x_preds + state_proj[:, 0:-1]  # last bit is for ACT
 
                 z_t, params_t = self.vae.posterior(x_trunc_t)
@@ -78,6 +82,8 @@ class SaccaderReinforce(Saccader):
                 # l_t = F.tanh(z_t['posterior'].detach())
                 l_t = F.tanh(params_t['posterior']['gaussian']['mu'].detach())
                 # mu, l_t = self.vae.get_locator()
+
+                nan_check_and_break(l_t, "L_t location")
 
                 # p = D.Normal(mu, self.config['std']).log_prob(l_t)
                 # p = torch.sum(p, dim=1)
@@ -89,6 +95,9 @@ class SaccaderReinforce(Saccader):
 
                 # call forward baseline here
                 base_score = self.vae.get_baseline()
+
+                nan_check_and_break(base_score, 'base_score')
+                nan_check_and_break(x_trunc_t, 'x_trunc_t')
 
                 # cache for loss function & visualization
                 params.append(params_t)
@@ -112,7 +121,7 @@ class SaccaderReinforce(Saccader):
                 'location': locs,
                 # 'log_pi': log_pi,
                 'baselines': baselines,
-                'act': act / max(i, 1),
+                # 'act': act / max(i, 1),
                 'saccades_scalar': i,
                 # 'decoded': decodes,
                 'params': params,
@@ -157,7 +166,7 @@ class SaccaderReinforce(Saccader):
         locations = output_map['location']
 
         # nan_check_and_break(torch.stack(locations), "locations")
-        # nan_check_and_break(torch.stack(log_probas), "log_probas")
+        nan_check_and_break(log_probas, "log_probas")
 
         log_pi = zeros((batch_size, ), x.is_cuda)
         baselines = zeros((batch_size, ), x.is_cuda)
