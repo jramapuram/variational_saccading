@@ -273,8 +273,10 @@ def _add_loss_map(loss_tm1, loss_t):
 def _mean_map(loss_map):
     ''' helper to reduce all values by the key count '''
     for k in loss_map.keys():
+        if k == 'count':
+            continue
         loss_map[k] /= loss_map['count']
-
+    loss_map['count'] = 1
     return loss_map
 
 
@@ -363,10 +365,10 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                     labels, size_average=True
                 )
 
-                if loss_t['accuracy_mean'] * 100.0 > 100:
-                    print(output_map['preds'])
-
+                # print("Accuracy mean during run {} ".format(loss_t['accuracy_mean']))
                 loss_map = _add_loss_map(loss_map, loss_t)
+                # print("Accuracy mean during run {} ".format(loss_map['accuracy_mean']))
+
                 num_samples += x_related.size(0)
 
         if 'train' in prefix:    # compute bp and optimize
@@ -399,9 +401,12 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
 
             del loss_t
 
-
-    loss_map = _mean_map(loss_map)  # reduce the map to get actual means
-    correct_percent = 100.0 * loss_map['accuracy_mean']
+    final_loss_map = _mean_map(loss_map)  # reduce the map to get actual means
+    correct_percent = 100.0 * final_loss_map['accuracy_mean']
+    if correct_percent > 100:
+        print(loss_map['count'])
+        print(loss_map['accuracy_mean'])
+        print('Correct percentage {}'.format(correct_percent))
 
     # print('{}[Epoch {}][{} samples][{:.2f} sec]:\
     # Average loss: {:.4f}\tKLD: {:.4f}\t\
@@ -416,10 +421,10 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
     print('{}[Epoch {}][{} samples][{:.2f} sec]:\
     Average loss: {:.4f}\t Action loss: {:.4f}\t Baseline loss: {:.4f}\t REINFORCE loss :{:.4f}\t Acc: {:.4f}'.format(
         prefix, epoch, num_samples, time.time() - start_time,
-        loss_map['loss_mean'].item(),
-        loss_map['actions_mean'].item(),
-        loss_map['baselines_mean'].item(),
-        loss_map['reinforce_mean'].item(),
+        final_loss_map['loss_mean'].item(),
+        final_loss_map['actions_mean'].item(),
+        final_loss_map['baselines_mean'].item(),
+        final_loss_map['reinforce_mean'].item(),
         correct_percent))
 
     # gather scalar values of reparameterizers (if they exist)

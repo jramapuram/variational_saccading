@@ -107,6 +107,8 @@ class SaccaderReinforce(Saccader):
                 # log_pi.append(p)
                 baselines.append(base_score.squeeze())
 
+                plot_tensor_grid(x_trunc_t.cpu(), 'crops_' + str(i) + '_.png')
+
             # After last time step
             preds = self.latent_projector.get_output(
                 x_preds / self.config['max_time_steps']
