@@ -364,11 +364,7 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
                     output_map['preds'],
                     labels, size_average=True
                 )
-
-                # print("Accuracy mean during run {} ".format(loss_t['accuracy_mean']))
                 loss_map = _add_loss_map(loss_map, loss_t)
-                # print("Accuracy mean during run {} ".format(loss_map['accuracy_mean']))
-
                 num_samples += x_related.size(0)
 
         if 'train' in prefix:    # compute bp and optimize
@@ -403,11 +399,6 @@ def execute_graph(epoch, model, data_loader, grapher, optimizer=None,
 
     final_loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     correct_percent = 100.0 * final_loss_map['accuracy_mean']
-    if correct_percent > 100:
-        print(loss_map['count'])
-        print(loss_map['accuracy_mean'])
-        print('Correct percentage {}'.format(correct_percent))
-
     # print('{}[Epoch {}][{} samples][{:.2f} sec]:\
     # Average loss: {:.4f}\tKLD: {:.4f}\t\
     # NLL: {:.4f}\tAcc: {:.4f}'.format(
