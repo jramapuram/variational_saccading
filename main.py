@@ -17,7 +17,6 @@ from torch.autograd import Variable
 import matplotlib
 matplotlib.use('Agg')
 
-
 from models.vae.vrnn import VRNN
 from models.vae.vrnn_reinforce import VRNNReinforce
 
