@@ -2,75 +2,94 @@
 
 from __future__ import print_function
 
+import os
 import argparse
 import numpy as np
 from subprocess import call
-
+from os.path import expanduser
 
 parser = argparse.ArgumentParser(description='Variational Saccading MNIST HP Search')
 parser.add_argument('--num-trials', type=int, default=50,
                     help="number of different models to run for the HP search (default: 50)")
-parser.add_argument('--num-titans', type=int, default=6,
-                    help="number of TitanXP's (default: 6)")
+parser.add_argument('--num-titans', type=int, default=15,
+                    help="number of TitanXP's (default: 15)")
 parser.add_argument('--num-pascals', type=int, default=15,
                     help="number of P100's (default: 15)")
+parser.add_argument('--singularity-img', type=str, default=None,
+                    help="if provided uses a singularity image (default: None)")
+parser.add_argument('--early-stop', action='store_true', default=False,
+                    help='enable early stopping (default: False)')
 args = parser.parse_args()
 
 
 def get_rand_hyperparameters():
     return {
-        'max-time-step': np.random.choice([1, 2, 3, 4]),
-        'upsample-size': 400,
-        'downsample-scale': 6,
-        'window-size': 32,
-        'epochs': 2000,                               # FIXED, but uses ES
+        'seed': 1234,
+        'max-time-steps': np.random.choice([2, 3, 4]),
+        'synthetic-upsample-size': 100,
+        'downsample-scale': np.random.choice([1, 2, 3, 4, 5, 6]),
+        'window-size': np.random.choice([32, 64]),
+        'epochs': 2000,                              # FIXED, but uses ES
         'task': 'clutter',                            # FIXED
-        'data-dir': '/home/ramapur0/variational_saccading/cluttered_mnist',
+        'data-dir': os.path.join(expanduser("~"), 'datasets/cluttered_mnist_2digits_120k'),
         'visdom-url': 'http://neuralnetworkart.com', # FIXED
-        'visdom-port': 8098,                         # FIXED
-        'max-image-percentage': np.random.choice([0.15, 0.2, 0.3, 0.35]),
+        'visdom-port': 8097,                         # FIXED
+        'lr': np.random.choice([1e-4, 2e-4, 3e-4, 1e-5]),
+        #'crop-padding': np.random.choice([2, 3, 4, 5, 6, 7, 8]),
+        'clip': np.random.choice([0, 0.25, 1.0, 5.0, 10.0, 15.0]),
+        'latent-size': np.random.choice([64, 128, 256, 512]),
+        'max-image-percentage': np.random.choice([0.2, 0.22, 0.25, 0.3]),
         'dense-normalization': np.random.choice(['batchnorm', 'none']),
         'conv-normalization': np.random.choice(['groupnorm', 'batchnorm', 'none']),
-        'batch-size': np.random.choice([32, 64, 128, 256]),
-        'reparam-type': np.random.choice(['mixture', 'isotropic_gaussian']),
-        'encoder-layer-type': np.random.choice(['conv', 'dense']),
+        'batch-size': np.random.choice([32, 40, 64, 128]),
+        'reparam-type': np.random.choice(['beta', 'mixture', 'isotropic_gaussian', 'discrete']),
+        'encoder-layer-type': np.random.choice(['conv', 'dense', 'resnet']),
         'decoder-layer-type': np.random.choice(['conv', 'dense']),
         'discrete-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
-        'continuous-size': np.random.choice([6, 8, 10, 20, 30, 40, 64]),
-        'optimizer': np.random.choice(['adam', 'rmsprop', 'sgd_momentum']),
+        'continuous-size': np.random.choice([6, 10, 40, 64, 128]),
+        'optimizer': np.random.choice(['adam', 'adamnorm', 'rmsprop']),
+        'use-noisy-rnn-state': np.random.choice([1, 0]),
+        'add-img-noise': np.random.choice([1, 0]),
+        'use-prior-kl': np.random.choice([1, 0]),
+        'activation': np.random.choice(['identity', 'selu', 'elu', 'relu', 'softplus']),
+        'disable-gated': np.random.choice([1, 0]),
+        'kl-reg': np.random.choice([1.0, 1.1, 1.2, 1.3, 1.5, 1.6, 1.7, 1.8, 2.0, 3.0, 5.0]),
         # 'continuous-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
         # 'discrete-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
-        'use-pixel-cnn-decoder': np.random.choice([1, 0]),
-        'disable-gated': np.random.choice([1, 0]),
         # 'monte-carlo-infogain': np.random.choice([1, 0]),
-        'kl-reg': np.random.choice([1.0, 1.0, 1.0, 1.0, 1.1, 1.2, 1.3, 2.0, 3.0]),
         # 'generative-scale-var': np.random.choice([1.0, 1.01, 1.02, 1.03, 1.04, 1.05, 1.1]),
-        # 'mut-clamp-strategy': np.random.choice(['norm']), #TODO: randomize and test against clamp
+        # 'mut-clamp-strategy': np.random.choice(['clamp', 'none', 'norm']),
         # 'mut-clamp-value': np.random.choice([1, 2, 5, 10, 30, 50, 100])
     }
 
 def format_job_str(job_map, run_str):
+    singularity_str = "" if args.singularity_img is None \
+        else "module load GCC/6.3.0-2.27 Singularity/2.4.2"
     return """#!/bin/bash -l
 
 #SBATCH --job-name={}
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=4
 #SBATCH --partition={}
 #SBATCH --time={}
-#SBATCH --gres=gpu:{}:1
+#SBATCH --gres=gpu:1
 #SBATCH --mem=32000
 #SBATCH --constraint="COMPUTE_CAPABILITY_6_0|COMPUTE_CAPABILITY_6_1"
-srun {}""".format(
-        job_map['job-name'],
-        job_map['partition'],
-        job_map['time'],
-        job_map['gpu'],
-        run_str
+echo $CUDA_VISIBLE_DEVICES
+{}
+srun --unbuffered {}""".format(
+    job_map['job-name'],
+    job_map['partition'],
+    job_map['time'],
+    singularity_str,
+    # job_map['gpu'],
+    run_str
 )
 
 def unroll_hp_and_value(hpmap):
     base_str = ""
-    no_value_keys = ["disable-gated", "use-pixel-cnn-decoder", "monte-carlo-infogain"]
+    no_value_keys = ["disable-gated", "use-pixel-cnn-decoder", "monte-carlo-infogain",
+                     "use-noisy-rnn-state", "use-prior-kl", "add-img-noise"]
     for k, v in hpmap.items():
         if k in no_value_keys and v == 0:
             continue
@@ -92,10 +111,15 @@ def unroll_hp_and_value(hpmap):
 
 def format_task_str(hp):
     hpmap_str = unroll_hp_and_value(hp) # --model-dir=.nonfidmodels
-    return """/home/ramapur0/.venv3/bin/python ../main.py
-    --early-stop {} --uid={}""".format(
+    python_native = os.path.join(expanduser("~"), '.venv3/bin/python')
+    python_bin = "singularity exec -B /home/ramapur0/opt:/opt --nv {} python".format(
+        args.singularity_img) if args.singularity_img is not None else python_native
+    early_str = "--early-stop" if args.early_stop else ""
+    return """{} ../main.py {} {} --uid={}""".format(
+        python_bin,
+        early_str,
         hpmap_str,
-        "{}".format(hp['task']) + "_hp_search{}_"
+        "{}".format('almost2_' + hp['task']) + "_hp_search{}_"
     ).replace("\n", " ").replace("\r", "").replace("   ", " ").replace("  ", " ").strip()
 
 def get_job_map(idx, gpu_type):

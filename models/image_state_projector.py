@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 
-from helpers.layers import get_encoder, str_to_activ
+from helpers.layers import get_encoder, str_to_activ, str_to_activ_module
 
 
 class ImageStateProjector(nn.Module):
@@ -15,11 +15,19 @@ class ImageStateProjector(nn.Module):
 
     def forward(self, x, state):
         conv_features = self.conv(x)
-        # combined = str_to_activ(self.config['activation'])(
-        #     torch.cat([state, conv_features], -1)
-        # )
-        # return self.state_proj(combined)
-        return conv_features
+        if not self.config['disable_rnn_proj']:
+            # combined = str_to_activ(self.config['activation'])(
+            #     torch.cat([state, conv_features], -1)
+            # )
+            combined = torch.cat([state, conv_features], -1)
+            return self.state_proj(combined)
+
+        return self.state_proj(conv_features)
+
+    def fp16(self):
+        self.conv = self.conv.half()
+        self.state_proj = self.state_proj.half()
+        self.out_proj = self.out_proj.half()
 
     def parallel(self):
         self.conv = nn.DataParallel(self.conv)
@@ -42,21 +50,42 @@ class ImageStateProjector(nn.Module):
                      self.config['window_size']]
 
         # main function approximator to extract crop features
+        nlayer_map = {
+            'conv': { 32: 4, 70: 6, 100: 7 },
+            'resnet': { 32: None, 64: None, 70: None, 100: None },
+            'dense': { 32: 3, 64: 3, 70: 3, 100: 3 }
+        }
+        bilinear_size = (self.config['window_size'], self.config['window_size'])
         conv = get_encoder(self.config, name='crop_feat')(
-            crop_size, self.config['latent_size']
+            crop_size, self.config['latent_size'],
+            activation_fn=str_to_activ_module(self.config['activation']),
+            num_layers=nlayer_map[
+                self.config['encoder_layer_type']][self.config['window_size']
+                ],
+            bilinear_size=bilinear_size
         )
 
         # takes the state + output of conv and projects it
+        # the +1 is for ACT
+        state_output_size = self.config['latent_size'] + 1 if self.config['concat_prediction_size'] <= 0 \
+            else self.config['concat_prediction_size'] + 1
+        state_input_size = self.config['latent_size'] if self.config['disable_rnn_proj'] \
+            else self.config['latent_size']*2
         state_projector = nn.Sequential(
             self._get_dense(name='state_proj')(
-                self.config['latent_size']*2, self.config['latent_size']
+                state_input_size, state_output_size,
+                normalization_str=self.config['dense_normalization'],
+                activation_fn=str_to_activ_module(self.config['activation'])
             )
         )
 
         # takes the finally aggregated vector and projects to output dims
+        input_size = self.config['concat_prediction_size'] * self.config['max_time_steps'] \
+            if self.config['concat_prediction_size'] > 0 else self.config['latent_size']
         output_projector = self._get_dense(name='output_proj')(
-            self.config['latent_size'], self.output_size,
-            normalization_str=self.config['dense_normalization']
+            input_size, self.output_size,
+            normalization_str=self.config['dense_normalization'],
+            activation_fn=str_to_activ_module(self.config['activation'])
         )
 
         return conv, state_projector, output_projector
