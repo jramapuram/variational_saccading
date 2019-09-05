@@ -11,4 +11,4 @@ CMD=$1
 echo "executing $CMD "
 
 # execute it in docker
-nvidia-docker run --ipc=host -v $HOME/datasets:/datasets -v ${ROOT_DIR}:/workspace -it jramapuram/pytorch:0.41 $CMD
+nvidia-docker run --ipc=host -v $HOME/datasets:/datasets -v ${ROOT_DIR}:/workspace -it jramapuram/variational_saccading:cluttered_mnist-v0 $CMD
