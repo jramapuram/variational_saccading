@@ -1,6 +1,7 @@
 # variational_saccading
 
 Implementation of [Variational Saccading: Efficient Inference for Large Resolution Images](https://arxiv.org/abs/1812.03170).  
+![poster](poster/Variational_Saccading_BMVC2019.png)  
 
 If you use this code or the ideas therein please cite:
 
