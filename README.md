@@ -19,6 +19,8 @@ If you use this code or the ideas therein please cite:
 The following runs a smaller version of the Two-Digit-Cluttered MNIST problem from the paper (images are 100x100).  
 Be sure to spinup a [visdom server](https://github.com/facebookresearch/visdom) and change `YOUR_VISDOM_URL` and `YOUR_VISDOM_PORT` below to match your IP/hostname and port.
 
+Clone the repo with **submodules**: `git clone --recursive https://github.com/jramapuram/variational_saccading` and run the following from the downloaded repo:
+
 ```bash
 sh ./docker/run.sh "python main.py --seed=1234 --max-time-steps=4 --synthetic-upsample-size=100 \  
 --downsample-scale=6 --window-size=64 --epochs=2000 --task=clutter --data-dir=/cluttered_mnist \  
