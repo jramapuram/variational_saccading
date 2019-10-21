@@ -31,3 +31,5 @@ sh ./docker/run.sh "python main.py --seed=1234 --max-time-steps=4 --synthetic-up
 --continuous-size=6 --optimizer=adam --use-noisy-rnn-state --activation=elu \  
 --disable-gated --kl-reg=5.0 --ngpu=1 --uid=saccadingExp1"
 ```
+
+![setup](imgs/setup.gif)  
