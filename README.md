@@ -1,4 +1,6 @@
-# variational_saccading
+# variational_saccading [![DOI](https://zenodo.org/badge/124655768.svg)](https://zenodo.org/badge/latestdoi/124655768)
+
+
 
 Implementation of [Variational Saccading: Efficient Inference for Large Resolution Images](https://arxiv.org/abs/1812.03170).  
 ![poster](poster/Variational_Saccading_BMVC2019.png)  
